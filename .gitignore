@@ -1,0 +1,8 @@
+.env
+mapping.json
+triage_migration.csv
+*.csv
+.claude/
+.vscode/
+__pycache__/
+*.pyc
