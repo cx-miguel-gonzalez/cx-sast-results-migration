@@ -91,7 +91,8 @@ The script will:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--project NAME_OR_ID` | *(required)* | Full project name (`CxServer\ProjectName`) or numeric project ID |
+| `--project NAME_OR_ID` | *(one of `--project` / `--project-list` required)* | Full project name (`CxServer\ProjectName`) or numeric project ID |
+| `--project-list NAME_OR_ID,...` | *(one of `--project` / `--project-list` required)* | Comma-separated list of project names/IDs to migrate one after another |
 | `--mapping PATH` | `mapping.json` | Path to the query mapping file produced by `generate_mapping.py` |
 | `--output PATH` | `triage_migration.csv` | Path for the output CSV report |
 | `--similarity-calculator PATH` | *(none)* | Path to `SimilarityCalculator.exe` (Windows only, optional) |
@@ -111,6 +112,16 @@ Review the CSV output, then run without `--dry-run` to apply the changes:
 ```bash
 python3 migrate_triages.py --project "CxServer\MyProject"
 ```
+
+### Example — migrate multiple projects
+
+Pass `--project-list` instead of `--project` to migrate several projects in one run. Each project is processed fully (find, match, upload) in turn before moving to the next; the CSV report accumulates rows for all of them, distinguished by `source_project_id`/`target_project_id`:
+
+```bash
+python3 migrate_triages.py --project-list "CxServer\MyProject,CxServer\OtherProject,101"
+```
+
+If a project in the list can't be found (or has no finished scans), the script logs an error, skips it, and continues with the rest of the list; it exits non-zero at the end if any project failed.
 
 ### CSV report columns
 

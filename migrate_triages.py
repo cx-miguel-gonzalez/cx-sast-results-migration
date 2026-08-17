@@ -602,89 +602,47 @@ def upload_all_triages(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Per-project migration
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Migrate SAST triage data from source project to target project."
-    )
-    parser.add_argument("--project",  required=True,
-                        help="Source project name (exact, case-insensitive) or numeric project ID")
-    parser.add_argument("--mapping",  default=os.getenv("MAPPING_FILE", "mapping.json"),
-                        help="Path to query mapping JSON (default: mapping.json)")
-    parser.add_argument("--output",   default="triage_migration.csv",
-                        help="Output CSV file (default: triage_migration.csv)")
-    parser.add_argument("--similarity-calculator", default=None, metavar="EXE",
-                        help="Path to SimilarityCalculator.exe (Windows only, optional). "
-                             "Computes target similarity IDs from source path node data + "
-                             "mapped target query IDs.")
-    parser.add_argument("--sim-version", default="0", choices=["0", "1", "2"],
-                        help="SimilarityCalculator version argument (default: 0)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Fetch and match everything but skip uploading triages")
-    args = parser.parse_args()
+def process_project(
+    project_input: str,
+    source_env: SastEnv,
+    target_env: SastEnv,
+    src_queries: dict,
+    tgt_queries: dict,
+    tgt_query_by_key: Dict[tuple, int],
+    mapping: dict,
+    sim_exe: Optional[str],
+    args,
+) -> Tuple[List[dict], Dict[str, int], bool]:
+    """
+    Migrate triage data for a single project (find → match → upload).
 
-    def require_env(var: str, label: str) -> str:
-        val = os.getenv(var, "").strip()
-        if not val:
-            print(f"ERROR: {label} is not set ({var})", file=sys.stderr)
-            sys.exit(1)
-        return val
-
-    source_url  = require_env("SOURCE_URL",      "Source URL")
-    source_user = require_env("SOURCE_USERNAME",  "Source username")
-    source_pass = require_env("SOURCE_PASSWORD",  "Source password")
-    target_url  = require_env("TARGET_URL",       "Target URL")
-    target_user = require_env("TARGET_USERNAME",  "Target username")
-    target_pass = require_env("TARGET_PASSWORD",  "Target password")
-    verify_ssl  = os.getenv("VERIFY_SSL", "true").strip().lower() != "false"
-
-    if not verify_ssl:
-        disable_warnings(InsecureRequestWarning)
-        print("WARNING: SSL verification disabled", file=sys.stderr)
-
-    # Validate mapping file
-    if not os.path.isfile(args.mapping):
-        print(f"ERROR: Mapping file not found: {args.mapping}. Run generate_mapping.py first.", file=sys.stderr)
-        sys.exit(1)
-    mapping = load_mapping(args.mapping)
-    print(f"Loaded {len(mapping)} query mappings from {args.mapping}")
-
-    # Validate SimilarityCalculator.exe
-    sim_exe = args.similarity_calculator
-    if sim_exe:
-        if platform.system() != "Windows":
-            print("WARNING: SimilarityCalculator.exe is Windows-only — skipping on this platform.", file=sys.stderr)
-            sim_exe = None
-        elif not os.path.isfile(sim_exe):
-            print(f"WARNING: SimilarityCalculator.exe not found: {sim_exe}", file=sys.stderr)
-            sim_exe = None
-
-    source_env = SastEnv(source_url, source_user, source_pass, verify_ssl)
-    target_env = SastEnv(target_url, target_user, target_pass, verify_ssl)
+    Returns (csv_rows, counts, ok). ok is False when the project or one of its
+    scans could not be found, so the caller can report it as a failure rather
+    than a project with zero triaged results.
+    """
+    counts = {"matched": 0, "not_found": 0, "query_missing": 0, "error": 0}
+    csv_rows: List[dict] = []
 
     # -----------------------------------------------------------------------
     # SOURCE
     # -----------------------------------------------------------------------
-    print(f"\n=== SOURCE ({source_url}) ===")
+    print(f"\n=== SOURCE ({source_env.url}) ===")
 
-    print(f"Finding project: {args.project!r}")
-    src_project = get_project(source_env, args.project)
+    print(f"Finding project: {project_input!r}")
+    src_project = get_project(source_env, project_input)
     if not src_project:
-        print(f"ERROR: Project {args.project!r} not found in source.", file=sys.stderr)
-        sys.exit(1)
+        print(f"ERROR: Project {project_input!r} not found in source.", file=sys.stderr)
+        return csv_rows, counts, False
     print(f"  [{src_project['Id']}] {src_project.get('_FullName') or src_project['Name']}")
 
     src_scan_id = get_latest_scan(source_env, src_project["Id"])
     if not src_scan_id:
         print("ERROR: No finished scans in source project.", file=sys.stderr)
-        sys.exit(1)
+        return csv_rows, counts, False
     print(f"  Latest finished scan: {src_scan_id}")
-
-    print("  Loading query collection...")
-    src_queries = get_query_collection(source_env)
-    print(f"  {len(src_queries)} queries")
 
     print("  Loading scan results (SOAP)...")
     all_src_results = get_results_soap(source_env, src_scan_id)
@@ -704,25 +662,21 @@ def main():
     # -----------------------------------------------------------------------
     # TARGET
     # -----------------------------------------------------------------------
-    print(f"\n=== TARGET ({target_url}) ===")
+    print(f"\n=== TARGET ({target_env.url}) ===")
 
     src_full_name = src_project.get("_FullName") or src_project["Name"]
     print(f"Finding project by name: {src_full_name!r}")
     tgt_project = get_project(target_env, src_full_name)
     if not tgt_project:
         print(f"ERROR: Project {src_full_name!r} not found in target.", file=sys.stderr)
-        sys.exit(1)
+        return csv_rows, counts, False
     print(f"  [{tgt_project['Id']}] {tgt_project.get('_FullName') or tgt_project['Name']}")
 
     tgt_scan_id = get_latest_scan(target_env, tgt_project["Id"])
     if not tgt_scan_id:
         print("ERROR: No finished scans in target project.", file=sys.stderr)
-        sys.exit(1)
+        return csv_rows, counts, False
     print(f"  Latest finished scan: {tgt_scan_id}")
-
-    print("  Loading query collection...")
-    tgt_queries = get_query_collection(target_env)
-    print(f"  {len(tgt_queries)} queries")
 
     print("  Loading scan results (SOAP)...")
     all_tgt_results = get_results_soap(target_env, tgt_scan_id)
@@ -733,15 +687,9 @@ def main():
     print(f"  {len(tgt_sim_map)} similarity IDs")
 
     # Index target results by QueryId for fast lookup
-    tgt_by_query: dict[int, list[dict]] = {}
+    tgt_by_query: Dict[int, list[dict]] = {}
     for r in all_tgt_results:
         tgt_by_query.setdefault(r["QueryId"], []).append(r)
-
-    # Build target query index: (language, group, name) → QueryId
-    tgt_query_by_key: dict[tuple, int] = {}
-    for qid, qi in tgt_queries.items():
-        key = (qi["LanguageName"].strip(), qi["PackageName"].strip(), qi["Name"].strip())
-        tgt_query_by_key[key] = qid
 
     # -----------------------------------------------------------------------
     # MATCH & COLLECT TRIAGES
@@ -752,9 +700,6 @@ def main():
     assignees:  list[dict] = []
     severities: list[dict] = []
     states:     list[dict] = []
-    csv_rows:   list[dict] = []
-
-    counts = {"matched": 0, "not_found": 0, "query_missing": 0, "error": 0}
 
     for orig in triaged_src:
         src_qid   = orig["QueryId"]
@@ -890,15 +835,6 @@ def main():
                          "computed_similarity_id": computed_sim,
                          "detail": ""})
 
-    # -----------------------------------------------------------------------
-    # CSV
-    # -----------------------------------------------------------------------
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(csv_rows)
-
-    print(f"\nCSV written to: {args.output}")
     print(f"  Matched:       {counts['matched']}")
     print(f"  Not found:     {counts['not_found']}")
     print(f"  Query missing: {counts['query_missing']}")
@@ -907,10 +843,139 @@ def main():
     # -----------------------------------------------------------------------
     # UPLOAD
     # -----------------------------------------------------------------------
-    print(f"\n=== Uploading triages ===")
+    print(f"\n=== Uploading triages for project [{src_project['Id']}] ===")
     upload_all_triages(target_env, comments, assignees, severities, states, args.dry_run)
 
+    return csv_rows, counts, True
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Migrate SAST triage data from source project to target project."
+    )
+    project_group = parser.add_mutually_exclusive_group(required=True)
+    project_group.add_argument("--project", default=None,
+                        help="Source project name (exact, case-insensitive) or numeric project ID")
+    project_group.add_argument("--project-list", default=None,
+                        help="Comma-separated list of source project names or numeric IDs to migrate")
+    parser.add_argument("--mapping",  default=os.getenv("MAPPING_FILE", "mapping.json"),
+                        help="Path to query mapping JSON (default: mapping.json)")
+    parser.add_argument("--output",   default="triage_migration.csv",
+                        help="Output CSV file (default: triage_migration.csv)")
+    parser.add_argument("--similarity-calculator", default=None, metavar="EXE",
+                        help="Path to SimilarityCalculator.exe (Windows only, optional). "
+                             "Computes target similarity IDs from source path node data + "
+                             "mapped target query IDs.")
+    parser.add_argument("--sim-version", default="0", choices=["0", "1", "2"],
+                        help="SimilarityCalculator version argument (default: 0)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Fetch and match everything but skip uploading triages")
+    args = parser.parse_args()
+
+    def require_env(var: str, label: str) -> str:
+        val = os.getenv(var, "").strip()
+        if not val:
+            print(f"ERROR: {label} is not set ({var})", file=sys.stderr)
+            sys.exit(1)
+        return val
+
+    source_url  = require_env("SOURCE_URL",      "Source URL")
+    source_user = require_env("SOURCE_USERNAME",  "Source username")
+    source_pass = require_env("SOURCE_PASSWORD",  "Source password")
+    target_url  = require_env("TARGET_URL",       "Target URL")
+    target_user = require_env("TARGET_USERNAME",  "Target username")
+    target_pass = require_env("TARGET_PASSWORD",  "Target password")
+    verify_ssl  = os.getenv("VERIFY_SSL", "true").strip().lower() != "false"
+
+    if not verify_ssl:
+        disable_warnings(InsecureRequestWarning)
+        print("WARNING: SSL verification disabled", file=sys.stderr)
+
+    # Validate mapping file
+    if not os.path.isfile(args.mapping):
+        print(f"ERROR: Mapping file not found: {args.mapping}. Run generate_mapping.py first.", file=sys.stderr)
+        sys.exit(1)
+    mapping = load_mapping(args.mapping)
+    print(f"Loaded {len(mapping)} query mappings from {args.mapping}")
+
+    # Validate SimilarityCalculator.exe
+    sim_exe = args.similarity_calculator
+    if sim_exe:
+        if platform.system() != "Windows":
+            print("WARNING: SimilarityCalculator.exe is Windows-only — skipping on this platform.", file=sys.stderr)
+            sim_exe = None
+        elif not os.path.isfile(sim_exe):
+            print(f"WARNING: SimilarityCalculator.exe not found: {sim_exe}", file=sys.stderr)
+            sim_exe = None
+
+    source_env = SastEnv(source_url, source_user, source_pass, verify_ssl)
+    target_env = SastEnv(target_url, target_user, target_pass, verify_ssl)
+
+    if args.project_list:
+        projects = [p.strip() for p in args.project_list.split(",") if p.strip()]
+        if not projects:
+            print("ERROR: --project-list did not contain any project names/IDs.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        projects = [args.project]
+
+    # Query collections are environment-wide, not project-specific, so fetch
+    # them once and reuse them across every project in the list.
+    print("Loading query collection (source)...")
+    src_queries = get_query_collection(source_env)
+    print(f"  {len(src_queries)} queries")
+
+    print("Loading query collection (target)...")
+    tgt_queries = get_query_collection(target_env)
+    print(f"  {len(tgt_queries)} queries")
+
+    tgt_query_by_key: Dict[tuple, int] = {}
+    for qid, qi in tgt_queries.items():
+        key = (qi["LanguageName"].strip(), qi["PackageName"].strip(), qi["Name"].strip())
+        tgt_query_by_key[key] = qid
+
+    all_csv_rows: List[dict] = []
+    total_counts = {"matched": 0, "not_found": 0, "query_missing": 0, "error": 0}
+    failed_projects: List[str] = []
+
+    for i, project_input in enumerate(projects, 1):
+        if len(projects) > 1:
+            print(f"\n{'#' * 70}\n# Project {i}/{len(projects)}: {project_input}\n{'#' * 70}")
+
+        csv_rows, counts, ok = process_project(
+            project_input, source_env, target_env,
+            src_queries, tgt_queries, tgt_query_by_key,
+            mapping, sim_exe, args,
+        )
+        if not ok:
+            failed_projects.append(project_input)
+        all_csv_rows.extend(csv_rows)
+        for k in total_counts:
+            total_counts[k] += counts[k]
+
+    # -----------------------------------------------------------------------
+    # CSV
+    # -----------------------------------------------------------------------
+    with open(args.output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(all_csv_rows)
+
+    print(f"\nCSV written to: {args.output}")
+    print(f"  Matched:       {total_counts['matched']}")
+    print(f"  Not found:     {total_counts['not_found']}")
+    print(f"  Query missing: {total_counts['query_missing']}")
+    print(f"  Errors:        {total_counts['error']}")
+    if failed_projects:
+        print(f"  Failed projects (not found / no scans): {', '.join(failed_projects)}", file=sys.stderr)
+
     print("\nDone.")
+    if failed_projects:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
