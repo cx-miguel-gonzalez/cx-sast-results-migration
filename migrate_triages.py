@@ -30,6 +30,7 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -496,6 +497,37 @@ def get_triage_history_map(env: SastEnv, scan_id: int) -> Dict[int, List[dict]]:
     return hist
 
 
+def _write_source_triage_snapshot(project_id: int, scan_id: int, triaged: List[dict]) -> str:
+    """
+    Persist source triage data (state, severity, comment, assignee) for a
+    project's scan to a temp JSON file, keyed by source PathId.
+
+    Caching this locally lets the post-upload validation step compare
+    against the source values without re-querying the source environment.
+    """
+    fd, path = tempfile.mkstemp(prefix=f"triage_src_{project_id}_{scan_id}_", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                str(r["PathId"]): {
+                    "State": r["State"],
+                    "Severity": r["Severity"],
+                    "Comment": r["Comment"],
+                    "AssignedUser": r["AssignedUser"],
+                }
+                for r in triaged
+            },
+            f,
+        )
+    return path
+
+
+def _load_source_triage_snapshot(path: str) -> Dict[str, dict]:
+    """Load a temp JSON file previously written by _write_source_triage_snapshot."""
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 # ---------------------------------------------------------------------------
 # Result matching
 # ---------------------------------------------------------------------------
@@ -615,13 +647,15 @@ def process_project(
     mapping: dict,
     sim_exe: Optional[str],
     args,
-) -> Tuple[List[dict], Dict[str, int], bool]:
+) -> Tuple[List[dict], Dict[str, int], bool, bool]:
     """
     Migrate triage data for a single project (find → match → upload).
 
-    Returns (csv_rows, counts, ok). ok is False when the project or one of its
-    scans could not be found, so the caller can report it as a failure rather
-    than a project with zero triaged results.
+    Returns (csv_rows, counts, ok, skipped). ok is False when the project or
+    one of its scans could not be found, so the caller can report it as a
+    failure rather than a project with zero triaged results. skipped is True
+    when the target scan already has triage data, in which case the import
+    is not attempted so existing target triages are never overwritten.
     """
     counts = {"matched": 0, "not_found": 0, "query_missing": 0, "error": 0}
     csv_rows: List[dict] = []
@@ -635,13 +669,13 @@ def process_project(
     src_project = get_project(source_env, project_input)
     if not src_project:
         print(f"ERROR: Project {project_input!r} not found in source.", file=sys.stderr)
-        return csv_rows, counts, False
+        return csv_rows, counts, False, False
     print(f"  [{src_project['Id']}] {src_project.get('_FullName') or src_project['Name']}")
 
     src_scan_id = get_latest_scan(source_env, src_project["Id"])
     if not src_scan_id:
         print("ERROR: No finished scans in source project.", file=sys.stderr)
-        return csv_rows, counts, False
+        return csv_rows, counts, False, False
     print(f"  Latest finished scan: {src_scan_id}")
 
     print("  Loading scan results (SOAP)...")
@@ -659,194 +693,243 @@ def process_project(
         total_hist = sum(len(v) for v in src_triage_hist.values())
         print(f"  {total_hist} history entries across {len(src_triage_hist)} results")
 
-    # -----------------------------------------------------------------------
-    # TARGET
-    # -----------------------------------------------------------------------
-    print(f"\n=== TARGET ({target_env.url}) ===")
+    print("  Caching source triage snapshot (temp file)...")
+    triage_temp_path = _write_source_triage_snapshot(src_project["Id"], src_scan_id, triaged_src)
+    validation_map: Dict[int, int] = {}  # target PathId -> source PathId
 
-    src_full_name = src_project.get("_FullName") or src_project["Name"]
-    print(f"Finding project by name: {src_full_name!r}")
-    tgt_project = get_project(target_env, src_full_name)
-    if not tgt_project:
-        print(f"ERROR: Project {src_full_name!r} not found in target.", file=sys.stderr)
-        return csv_rows, counts, False
-    print(f"  [{tgt_project['Id']}] {tgt_project.get('_FullName') or tgt_project['Name']}")
+    try:
+        # -----------------------------------------------------------------------
+        # TARGET
+        # -----------------------------------------------------------------------
+        print(f"\n=== TARGET ({target_env.url}) ===")
 
-    tgt_scan_id = get_latest_scan(target_env, tgt_project["Id"])
-    if not tgt_scan_id:
-        print("ERROR: No finished scans in target project.", file=sys.stderr)
-        return csv_rows, counts, False
-    print(f"  Latest finished scan: {tgt_scan_id}")
+        src_full_name = src_project.get("_FullName") or src_project["Name"]
+        print(f"Finding project by name: {src_full_name!r}")
+        tgt_project = get_project(target_env, src_full_name)
+        if not tgt_project:
+            print(f"ERROR: Project {src_full_name!r} not found in target.", file=sys.stderr)
+            return csv_rows, counts, False, False
+        print(f"  [{tgt_project['Id']}] {tgt_project.get('_FullName') or tgt_project['Name']}")
 
-    print("  Loading scan results (SOAP)...")
-    all_tgt_results = get_results_soap(target_env, tgt_scan_id)
-    print(f"  {len(all_tgt_results)} total results")
+        tgt_scan_id = get_latest_scan(target_env, tgt_project["Id"])
+        if not tgt_scan_id:
+            print("ERROR: No finished scans in target project.", file=sys.stderr)
+            return csv_rows, counts, False, False
+        print(f"  Latest finished scan: {tgt_scan_id}")
 
-    print("  Loading SimilarityIds (OData)...")
-    tgt_sim_map = get_similarity_map(target_env, tgt_scan_id)
-    print(f"  {len(tgt_sim_map)} similarity IDs")
+        print("  Loading scan results (SOAP)...")
+        all_tgt_results = get_results_soap(target_env, tgt_scan_id)
+        print(f"  {len(all_tgt_results)} total results")
 
-    # Index target results by QueryId for fast lookup
-    tgt_by_query: Dict[int, list[dict]] = {}
-    for r in all_tgt_results:
-        tgt_by_query.setdefault(r["QueryId"], []).append(r)
+        if any(r["State"] > 0 or r["Comment"] or r["AssignedUser"] for r in all_tgt_results):
+            print(f"  SKIPPED: target scan {tgt_scan_id} already has triage data — "
+                  f"import skipped to avoid overwriting existing triages.")
+            csv_rows.append({
+                "status": "SKIPPED", "source_project_id": src_project["Id"],
+                "source_scan_id": src_scan_id, "target_project_id": tgt_project["Id"],
+                "target_scan_id": tgt_scan_id, "query_name": "", "language": "", "group": "",
+                "source_path_id": "", "target_path_id": "", "source_similarity_id": "",
+                "target_similarity_id": "", "computed_similarity_id": "",
+                "source_state": "", "source_severity": "", "source_comment": "",
+                "detail": "Target scan already has triage data; import skipped",
+            })
+            return csv_rows, counts, True, True
 
-    # -----------------------------------------------------------------------
-    # MATCH & COLLECT TRIAGES
-    # -----------------------------------------------------------------------
-    print(f"\n=== Matching {len(triaged_src)} triaged source results ===")
+        print("  Loading SimilarityIds (OData)...")
+        tgt_sim_map = get_similarity_map(target_env, tgt_scan_id)
+        print(f"  {len(tgt_sim_map)} similarity IDs")
 
-    comments:   list[dict] = []
-    assignees:  list[dict] = []
-    severities: list[dict] = []
-    states:     list[dict] = []
+        # Index target results by QueryId for fast lookup
+        tgt_by_query: Dict[int, list[dict]] = {}
+        for r in all_tgt_results:
+            tgt_by_query.setdefault(r["QueryId"], []).append(r)
 
-    for orig in triaged_src:
-        src_qid   = orig["QueryId"]
-        src_qinfo = src_queries.get(src_qid)
-        src_sim   = src_sim_map.get(orig["PathId"], "")
+        # -----------------------------------------------------------------------
+        # MATCH & COLLECT TRIAGES
+        # -----------------------------------------------------------------------
+        print(f"\n=== Matching {len(triaged_src)} triaged source results ===")
 
-        row_base = {
-            "source_project_id": src_project["Id"],
-            "source_scan_id":    src_scan_id,
-            "target_project_id": tgt_project["Id"],
-            "target_scan_id":    tgt_scan_id,
-            "source_path_id":    orig["PathId"],
-            "source_similarity_id": src_sim,
-            "source_state":    orig["State"],
-            "source_severity": orig["Severity"],
-            "source_comment":  orig["Comment"],
-        }
+        comments:   list[dict] = []
+        assignees:  list[dict] = []
+        severities: list[dict] = []
+        states:     list[dict] = []
 
-        if not src_qinfo:
-            counts["error"] += 1
-            csv_rows.append({**row_base, "status": "ERROR", "query_name": "", "language": "",
-                             "group": "", "target_path_id": "", "target_similarity_id": "",
-                             "computed_similarity_id": "",
-                             "detail": f"Source QueryId {src_qid} not in query collection"})
-            continue
+        for orig in triaged_src:
+            src_qid   = orig["QueryId"]
+            src_qinfo = src_queries.get(src_qid)
+            src_sim   = src_sim_map.get(orig["PathId"], "")
 
-        lang  = src_qinfo["LanguageName"]
-        group = src_qinfo["PackageName"]
-        name  = src_qinfo["Name"]
-        mk    = (lang.strip(), group.strip(), name.strip())
+            row_base = {
+                "source_project_id": src_project["Id"],
+                "source_scan_id":    src_scan_id,
+                "target_project_id": tgt_project["Id"],
+                "target_scan_id":    tgt_scan_id,
+                "source_path_id":    orig["PathId"],
+                "source_similarity_id": src_sim,
+                "source_state":    orig["State"],
+                "source_severity": orig["Severity"],
+                "source_comment":  orig["Comment"],
+            }
 
-        # Resolve target QueryId: prefer mapping.json, fall back to direct name match
-        tgt_qid_str = mapping.get(mk)
-        if not tgt_qid_str:
-            direct = tgt_query_by_key.get(mk)
-            if direct:
-                tgt_qid_str = str(direct)
-            else:
-                counts["query_missing"] += 1
-                csv_rows.append({**row_base, "status": "NO_QUERY", "query_name": name,
-                                 "language": lang, "group": group, "target_path_id": "",
-                                 "target_similarity_id": "", "computed_similarity_id": "",
-                                 "detail": "Query not in mapping.json and not found in target"})
+            if not src_qinfo:
+                counts["error"] += 1
+                csv_rows.append({**row_base, "status": "ERROR", "query_name": "", "language": "",
+                                 "group": "", "target_path_id": "", "target_similarity_id": "",
+                                 "computed_similarity_id": "",
+                                 "detail": f"Source QueryId {src_qid} not in query collection"})
                 continue
 
-        tgt_qid = int(tgt_qid_str)
+            lang  = src_qinfo["LanguageName"]
+            group = src_qinfo["PackageName"]
+            name  = src_qinfo["Name"]
+            mk    = (lang.strip(), group.strip(), name.strip())
 
-        # Optionally compute new SimilarityId via SimilarityCalculator.exe
-        computed_sim = ""
-        if sim_exe:
-            src_path = os.path.join(orig["SourceFolder"], orig["SourceFile"]) if orig["SourceFolder"] else orig["SourceFile"]
-            dst_path = os.path.join(orig["DestFolder"],   orig["DestFile"])   if orig["DestFolder"]   else orig["DestFile"]
-            computed_sim = run_similarity_calculator(
-                sim_exe,
-                src_path, orig["SourceObject"], str(orig["SourceLine"]),
-                dst_path, orig["DestObject"],   str(orig["DestLine"]),
-                tgt_qid_str, args.sim_version,
-            ) or ""
+            # Resolve target QueryId: prefer mapping.json, fall back to direct name match
+            tgt_qid_str = mapping.get(mk)
+            if not tgt_qid_str:
+                direct = tgt_query_by_key.get(mk)
+                if direct:
+                    tgt_qid_str = str(direct)
+                else:
+                    counts["query_missing"] += 1
+                    csv_rows.append({**row_base, "status": "NO_QUERY", "query_name": name,
+                                     "language": lang, "group": group, "target_path_id": "",
+                                     "target_similarity_id": "", "computed_similarity_id": "",
+                                     "detail": "Query not in mapping.json and not found in target"})
+                    continue
 
-        # Match by path nodes
-        dest = match_result(orig, tgt_by_query.get(tgt_qid, []))
-        if dest is None:
-            counts["not_found"] += 1
-            csv_rows.append({**row_base, "status": "NOT_FOUND", "query_name": name,
-                             "language": lang, "group": group, "target_path_id": "",
-                             "target_similarity_id": "", "computed_similarity_id": computed_sim,
-                             "detail": "No matching result found in target scan"})
-            print(f"  NOT FOUND  [{src_qid}→{tgt_qid}] {lang}/{name} "
-                  f"src={orig['SourceFile']}:{orig['SourceLine']} "
-                  f"dst={orig['DestFile']}:{orig['DestLine']}")
-            continue
+            tgt_qid = int(tgt_qid_str)
 
-        counts["matched"] += 1
-        dest_sim = tgt_sim_map.get(dest["PathId"], "")
-        base_triage = {
-            "projectId": tgt_project["Id"],
-            "scanId":    tgt_scan_id,
-            "PathId":    dest["PathId"],
-        }
+            # Optionally compute new SimilarityId via SimilarityCalculator.exe
+            computed_sim = ""
+            if sim_exe:
+                src_path = os.path.join(orig["SourceFolder"], orig["SourceFile"]) if orig["SourceFolder"] else orig["SourceFile"]
+                dst_path = os.path.join(orig["DestFolder"],   orig["DestFile"])   if orig["DestFolder"]   else orig["DestFile"]
+                computed_sim = run_similarity_calculator(
+                    sim_exe,
+                    src_path, orig["SourceObject"], str(orig["SourceLine"]),
+                    dst_path, orig["DestObject"],   str(orig["DestLine"]),
+                    tgt_qid_str, args.sim_version,
+                ) or ""
 
-        # Comments: fetch full history and add any entries missing from target
-        src_cmts: List[str] = []
-        if orig["Comment"]:
-            src_cmts = get_path_comments(source_env, src_scan_id, orig["PathId"])
-            tgt_cmts = (get_path_comments(target_env, tgt_scan_id, dest["PathId"])
-                        if dest["Comment"] else [])
-            missing_cmt = _build_missing_comment(src_cmts, tgt_cmts)
-            if missing_cmt:
-                comments.append({**base_triage, "ResultLabelType": LABEL_COMMENT,
-                                 "Remarks": missing_cmt, "data": missing_cmt})
+            # Match by path nodes
+            dest = match_result(orig, tgt_by_query.get(tgt_qid, []))
+            if dest is None:
+                counts["not_found"] += 1
+                csv_rows.append({**row_base, "status": "NOT_FOUND", "query_name": name,
+                                 "language": lang, "group": group, "target_path_id": "",
+                                 "target_similarity_id": "", "computed_similarity_id": computed_sim,
+                                 "detail": "No matching result found in target scan"})
+                print(f"  NOT FOUND  [{src_qid}→{tgt_qid}] {lang}/{name} "
+                      f"src={orig['SourceFile']}:{orig['SourceLine']} "
+                      f"dst={orig['DestFile']}:{orig['DestLine']}")
+                continue
 
-        # State/severity/assignee: replay every historical change in order if OData
-        # history is available; otherwise fall back to applying the final state only.
-        path_history = src_triage_hist.get(orig["PathId"], [])
-        if path_history:
-            prev_state = 0
-            prev_sev   = -1
-            prev_user  = ""
-            for entry in path_history:
-                e_state = entry.get("State") or 0
-                e_sev   = entry.get("Severity") if entry.get("Severity") is not None else -1
-                e_user  = entry.get("AssignedToUser") or entry.get("AssignedUser") or ""
-                if e_state and e_state != prev_state:
+            counts["matched"] += 1
+            validation_map[dest["PathId"]] = orig["PathId"]
+            dest_sim = tgt_sim_map.get(dest["PathId"], "")
+            base_triage = {
+                "projectId": tgt_project["Id"],
+                "scanId":    tgt_scan_id,
+                "PathId":    dest["PathId"],
+            }
+
+            # Comments: fetch full history and add any entries missing from target
+            src_cmts: List[str] = []
+            if orig["Comment"]:
+                src_cmts = get_path_comments(source_env, src_scan_id, orig["PathId"])
+                tgt_cmts = (get_path_comments(target_env, tgt_scan_id, dest["PathId"])
+                            if dest["Comment"] else [])
+                missing_cmt = _build_missing_comment(src_cmts, tgt_cmts)
+                if missing_cmt:
+                    comments.append({**base_triage, "ResultLabelType": LABEL_COMMENT,
+                                     "Remarks": missing_cmt, "data": missing_cmt})
+
+            # State/severity/assignee: replay every historical change in order if OData
+            # history is available; otherwise fall back to applying the final state only.
+            path_history = src_triage_hist.get(orig["PathId"], [])
+            if path_history:
+                prev_state = 0
+                prev_sev   = -1
+                prev_user  = ""
+                for entry in path_history:
+                    e_state = entry.get("State") or 0
+                    e_sev   = entry.get("Severity") if entry.get("Severity") is not None else -1
+                    e_user  = entry.get("AssignedToUser") or entry.get("AssignedUser") or ""
+                    if e_state and e_state != prev_state:
+                        states.append({**base_triage, "ResultLabelType": LABEL_STATE,
+                                       "Remarks": None, "data": e_state})
+                        prev_state = e_state
+                    if e_sev >= 0 and e_sev != prev_sev:
+                        severities.append({**base_triage, "ResultLabelType": LABEL_SEVERITY,
+                                           "Remarks": None, "data": e_sev})
+                        prev_sev = e_sev
+                    if e_user and e_user != prev_user:
+                        assignees.append({**base_triage, "ResultLabelType": LABEL_ASSIGNEE,
+                                          "Remarks": None, "data": e_user})
+                        prev_user = e_user
+            else:
+                # Fallback: apply final state only
+                if orig["State"] > 0 and orig["State"] != dest["State"]:
                     states.append({**base_triage, "ResultLabelType": LABEL_STATE,
-                                   "Remarks": None, "data": e_state})
-                    prev_state = e_state
-                if e_sev >= 0 and e_sev != prev_sev:
+                                   "Remarks": None, "data": orig["State"]})
+                if orig["Severity"] != dest["Severity"]:
                     severities.append({**base_triage, "ResultLabelType": LABEL_SEVERITY,
-                                       "Remarks": None, "data": e_sev})
-                    prev_sev = e_sev
-                if e_user and e_user != prev_user:
+                                       "Remarks": None, "data": orig["Severity"]})
+                if orig["AssignedUser"] and orig["AssignedUser"] != dest["AssignedUser"]:
                     assignees.append({**base_triage, "ResultLabelType": LABEL_ASSIGNEE,
-                                      "Remarks": None, "data": e_user})
-                    prev_user = e_user
-        else:
-            # Fallback: apply final state only
-            if orig["State"] > 0 and orig["State"] != dest["State"]:
-                states.append({**base_triage, "ResultLabelType": LABEL_STATE,
-                               "Remarks": None, "data": orig["State"]})
-            if orig["Severity"] != dest["Severity"]:
-                severities.append({**base_triage, "ResultLabelType": LABEL_SEVERITY,
-                                   "Remarks": None, "data": orig["Severity"]})
-            if orig["AssignedUser"] and orig["AssignedUser"] != dest["AssignedUser"]:
-                assignees.append({**base_triage, "ResultLabelType": LABEL_ASSIGNEE,
-                                  "Remarks": None, "data": orig["AssignedUser"]})
+                                      "Remarks": None, "data": orig["AssignedUser"]})
 
-        full_comment = "ÿ".join(src_cmts) if src_cmts else orig["Comment"]
-        csv_rows.append({**row_base, "status": "MATCHED", "query_name": name,
-                         "language": lang, "group": group,
-                         "source_comment":        full_comment,
-                         "target_path_id":        dest["PathId"],
-                         "target_similarity_id":  dest_sim,
-                         "computed_similarity_id": computed_sim,
-                         "detail": ""})
+            full_comment = "ÿ".join(src_cmts) if src_cmts else orig["Comment"]
+            csv_rows.append({**row_base, "status": "MATCHED", "query_name": name,
+                             "language": lang, "group": group,
+                             "source_comment":        full_comment,
+                             "target_path_id":        dest["PathId"],
+                             "target_similarity_id":  dest_sim,
+                             "computed_similarity_id": computed_sim,
+                             "detail": ""})
 
-    print(f"  Matched:       {counts['matched']}")
-    print(f"  Not found:     {counts['not_found']}")
-    print(f"  Query missing: {counts['query_missing']}")
-    print(f"  Errors:        {counts['error']}")
+        print(f"  Matched:       {counts['matched']}")
+        print(f"  Not found:     {counts['not_found']}")
+        print(f"  Query missing: {counts['query_missing']}")
+        print(f"  Errors:        {counts['error']}")
 
-    # -----------------------------------------------------------------------
-    # UPLOAD
-    # -----------------------------------------------------------------------
-    print(f"\n=== Uploading triages for project [{src_project['Id']}] ===")
-    upload_all_triages(target_env, comments, assignees, severities, states, args.dry_run)
+        # -----------------------------------------------------------------------
+        # UPLOAD
+        # -----------------------------------------------------------------------
+        print(f"\n=== Uploading triages for project [{src_project['Id']}] ===")
+        upload_all_triages(target_env, comments, assignees, severities, states, args.dry_run)
 
-    return csv_rows, counts, True
+        if not args.dry_run and validation_map:
+            print(f"\n=== Validating {len(validation_map)} uploaded triage(s) against source snapshot ===")
+            src_snapshot = _load_source_triage_snapshot(triage_temp_path)
+            fresh_tgt_results = get_results_soap(target_env, tgt_scan_id)
+            fresh_by_path = {r["PathId"]: r for r in fresh_tgt_results}
+            mismatches = 0
+            for tgt_path_id, src_path_id in validation_map.items():
+                actual = fresh_by_path.get(tgt_path_id)
+                src_rec = src_snapshot.get(str(src_path_id), {})
+                if actual is None:
+                    mismatches += 1
+                    print(f"  MISMATCH PathId={tgt_path_id}: result missing from target after upload")
+                    continue
+                problems = []
+                if actual["State"] != src_rec.get("State"):
+                    problems.append(f"state {actual['State']} != {src_rec.get('State')}")
+                if actual["Severity"] != src_rec.get("Severity"):
+                    problems.append(f"severity {actual['Severity']} != {src_rec.get('Severity')}")
+                if src_rec.get("AssignedUser") and actual["AssignedUser"] != src_rec.get("AssignedUser"):
+                    problems.append(f"assignee {actual['AssignedUser']!r} != {src_rec.get('AssignedUser')!r}")
+                if src_rec.get("Comment") and not actual["Comment"]:
+                    problems.append("comment missing")
+                if problems:
+                    mismatches += 1
+                    print(f"  MISMATCH PathId={tgt_path_id}: {', '.join(problems)}")
+            print(f"  Validated {len(validation_map) - mismatches}/{len(validation_map)} triages applied correctly")
+
+        return csv_rows, counts, True, False
+    finally:
+        os.remove(triage_temp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -941,18 +1024,21 @@ def main():
     all_csv_rows: List[dict] = []
     total_counts = {"matched": 0, "not_found": 0, "query_missing": 0, "error": 0}
     failed_projects: List[str] = []
+    skipped_projects: List[str] = []
 
     for i, project_input in enumerate(projects, 1):
         if len(projects) > 1:
             print(f"\n{'#' * 70}\n# Project {i}/{len(projects)}: {project_input}\n{'#' * 70}")
 
-        csv_rows, counts, ok = process_project(
+        csv_rows, counts, ok, skipped = process_project(
             project_input, source_env, target_env,
             src_queries, tgt_queries, tgt_query_by_key,
             mapping, sim_exe, args,
         )
         if not ok:
             failed_projects.append(project_input)
+        elif skipped:
+            skipped_projects.append(project_input)
         all_csv_rows.extend(csv_rows)
         for k in total_counts:
             total_counts[k] += counts[k]
@@ -970,6 +1056,8 @@ def main():
     print(f"  Not found:     {total_counts['not_found']}")
     print(f"  Query missing: {total_counts['query_missing']}")
     print(f"  Errors:        {total_counts['error']}")
+    if skipped_projects:
+        print(f"  Skipped projects (target already has triage data): {', '.join(skipped_projects)}")
     if failed_projects:
         print(f"  Failed projects (not found / no scans): {', '.join(failed_projects)}", file=sys.stderr)
 
