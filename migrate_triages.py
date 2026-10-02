@@ -38,7 +38,7 @@ from dotenv import load_dotenv
 from requests import Session
 from urllib3 import disable_warnings
 from urllib3.exceptions import InsecureRequestWarning
-from zeep import Client, Settings, xsd
+from zeep import Client, Settings
 from zeep.transports import Transport
 
 load_dotenv()
@@ -60,13 +60,6 @@ ODATA_CLIENT  = "resource_owner_sast_client"
 WSDL_PATH     = "/CxWebInterface/Portal/CxWebService.asmx?wsdl"
 ODATA_BASE    = "/Cxwebinterface/odata/v1"
 REST_BASE     = "/cxrestapi"
-
-COMMIT_CHUNKS = 100
-
-LABEL_COMMENT  = 1
-LABEL_SEVERITY = 2
-LABEL_STATE    = 3
-LABEL_ASSIGNEE = 4
 
 CSV_FIELDS = [
     "status",
@@ -166,6 +159,31 @@ class SastEnv:
             )
         resp.raise_for_status()
         return resp.json() if resp.content and len(resp.content) > 2 else []
+
+    def rest_patch(self, path: str, payload: object) -> Tuple[int, object]:
+        """
+        PATCH request. Returns (status_code, parsed_body) WITHOUT raising on a
+        non-2xx status — callers need the raw status/body for diagnostics,
+        since CxSAST's result-update endpoints have been seen to return a
+        success-looking status without actually applying the change.
+        """
+        if not self._rest_tk:
+            self._rest_tk = _get_token(self.url, self._user, self._pass, REST_SCOPE, REST_CLIENT, self.verify)
+        headers = {
+            "Authorization": self._rest_tk,
+            "Accept": "application/json;v=1.0",
+            "Content-Type": "application/json;v=1.0",
+        }
+        resp = requests.patch(self.url + path, headers=headers, json=payload, verify=self.verify, timeout=60)
+        if resp.status_code == 401:
+            self._rest_tk = _get_token(self.url, self._user, self._pass, REST_SCOPE, REST_CLIENT, self.verify)
+            headers["Authorization"] = self._rest_tk
+            resp = requests.patch(self.url + path, headers=headers, json=payload, verify=self.verify, timeout=60)
+        try:
+            body = resp.json() if resp.content else None
+        except ValueError:
+            body = resp.text
+        return resp.status_code, body
 
     # -- Access-control REST (same token as OData) ---------------------------
 
@@ -556,81 +574,56 @@ def match_result(orig: dict, candidates: List[dict]) -> Optional[dict]:
 # Triage upload
 # ---------------------------------------------------------------------------
 
-def _upload_batch(soap: Client, triages: list[dict], label: str) -> int:
-    """Upload a list of triage records in chunks. Returns count of failed items."""
-    if not triages:
-        return 0
-    factory = soap.type_factory("ns0")
-    failures = 0
-    for i in range(0, len(triages), COMMIT_CHUNKS):
-        chunk = triages[i : i + COMMIT_CHUNKS]
-        try:
-            triage_data = factory.ArrayOfResultStateData([
-                factory.ResultStateData(
-                    scanId=item["scanId"],
-                    PathId=item["PathId"],
-                    projectId=item["projectId"],
-                    Remarks=item["Remarks"] if item["Remarks"] else xsd.SkipValue,
-                    ResultLabelType=item["ResultLabelType"],
-                    data=item["data"],
-                ) for item in chunk
-            ])
-            soap.service.UpdateSetOfResultState(sessionID="0", resultsStates=triage_data)
-            print(f"  Uploaded {min(i + COMMIT_CHUNKS, len(triages))}/{len(triages)} {label}")
-        except Exception as e:
-            print(f"  ERROR uploading {label} chunk: {e}", file=sys.stderr)
-            failures += len(chunk)
-    return failures
+def upload_label_calls(env: SastEnv, scan_id: int, label_calls: List[dict], dry_run: bool) -> None:
+    """
+    Apply triage changes via `PATCH /cxrestapi/sast/scans/{scanId}/results/{pathId}/labels`,
+    one call per entry in `label_calls`, in order.
 
+    This is the endpoint CxSAST actually applies state changes through; the
+    older SOAP `UpdateSetOfResultState` call and the bulk `.../results` REST
+    endpoint were both found to silently no-op state changes.
 
-def upload_all_triages(
-    env: SastEnv,
-    comments: list[dict],
-    assignees: list[dict],
-    severities: list[dict],
-    states: list[dict],
-    dry_run: bool,
-) -> None:
-    """Upload triages in the required order: comments → assignees → severities → states."""
-    total = len(comments) + len(assignees) + len(severities) + len(states)
-    if total == 0:
+    `label_calls` entries carry a path's full historical sequence of changes
+    in order (see process_project), so replaying them call-by-call recreates
+    the source's triage timeline on the target. Each entry only includes the
+    field(s) that actually changed at that step (plus `comment`, always
+    present even if empty) — the target logs a distinct audit entry for
+    every field present in the request, even when the value sent matches
+    what's already there, so unchanged fields must be omitted rather than
+    resent with their current value.
+    """
+    if not label_calls:
         print("  No triage changes to upload.")
         return
     if dry_run:
-        print(f"  [DRY RUN] Would upload: {len(comments)} comments, {len(assignees)} assignees, "
-              f"{len(severities)} severities, {len(states)} states")
+        print(f"  [DRY RUN] Would upload {len(label_calls)} label update(s) via "
+              f"PATCH .../results/{{pathId}}/labels")
         return
 
-    soap = env.soap
-    factory = soap.type_factory("ns0")
     failures = 0
-
-    # Comments must be sent one at a time
-    for i, item in enumerate(comments, 1):
+    for i, item in enumerate(label_calls, 1):
+        path = f"{REST_BASE}/sast/scans/{scan_id}/results/{item['pathId']}/labels"
+        payload = {k: v for k, v in item.items() if k != "pathId"}
+        payload.setdefault("comment", "")
         try:
-            triage_data = factory.ArrayOfResultStateData([
-                factory.ResultStateData(
-                    scanId=item["scanId"],
-                    PathId=item["PathId"],
-                    projectId=item["projectId"],
-                    Remarks=item["Remarks"],
-                    ResultLabelType=item["ResultLabelType"],
-                    data=item["data"],
-                )
-            ])
-            soap.service.UpdateSetOfResultState(sessionID="0", resultsStates=triage_data)
+            status, body = env.rest_patch(path, payload)
         except Exception as e:
-            print(f"  ERROR uploading comment {i}/{len(comments)} (PathId={item['PathId']}): {e}", file=sys.stderr)
+            print(f"  ERROR uploading label update {i}/{len(label_calls)} "
+                  f"(PathId={item['pathId']}, request failed): {e}", file=sys.stderr)
             failures += 1
-    if comments:
-        print(f"  Uploaded {len(comments) - failures}/{len(comments)} comments")
+            continue
 
-    failures += _upload_batch(soap, assignees,  "assignees")
-    failures += _upload_batch(soap, severities, "severities")
-    failures += _upload_batch(soap, states,     "states")
+        if status >= 400:
+            failures += 1
+            print(f"  ERROR uploading label update {i}/{len(label_calls)}: HTTP {status} "
+                  f"PathId={item['pathId']} payload={payload} response={body}", file=sys.stderr)
+            continue
+
+        print(f"  Uploaded {i}/{len(label_calls)} label update "
+              f"PathId={item['pathId']} HTTP {status} payload={payload} response={body}")
 
     if failures:
-        print(f"  WARNING: {failures} triage upload(s) failed", file=sys.stderr)
+        print(f"  WARNING: {failures}/{len(label_calls)} label update(s) failed", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +636,7 @@ def process_project(
     target_env: SastEnv,
     src_queries: dict,
     tgt_queries: dict,
-    tgt_query_by_key: Dict[tuple, int],
+    tgt_query_by_key: Dict[tuple, List[int]],
     mapping: dict,
     sim_exe: Optional[str],
     args,
@@ -749,10 +742,7 @@ def process_project(
         # -----------------------------------------------------------------------
         print(f"\n=== Matching {len(triaged_src)} triaged source results ===")
 
-        comments:   list[dict] = []
-        assignees:  list[dict] = []
-        severities: list[dict] = []
-        states:     list[dict] = []
+        label_calls: List[dict] = []
 
         for orig in triaged_src:
             src_qid   = orig["QueryId"]
@@ -784,21 +774,28 @@ def process_project(
             name  = src_qinfo["Name"]
             mk    = (lang.strip(), group.strip(), name.strip())
 
-            # Resolve target QueryId: prefer mapping.json, fall back to direct name match
-            tgt_qid_str = mapping.get(mk)
-            if not tgt_qid_str:
-                direct = tgt_query_by_key.get(mk)
-                if direct:
-                    tgt_qid_str = str(direct)
-                else:
-                    counts["query_missing"] += 1
-                    csv_rows.append({**row_base, "status": "NO_QUERY", "query_name": name,
-                                     "language": lang, "group": group, "target_path_id": "",
-                                     "target_similarity_id": "", "computed_similarity_id": "",
-                                     "detail": "Query not in mapping.json and not found in target"})
-                    continue
+            # Resolve candidate target QueryIds: mapping.json's choice first (if any),
+            # then every other target query sharing this (language, group, name) — the
+            # same name can exist more than once in the target (e.g. a custom query
+            # overridden per-team/per-project), each copy with its own QueryId, and
+            # mapping.json only ever recorded one of them. Try each in turn and use
+            # whichever one actually has a matching result in this scan.
+            mapped_qid_str = mapping.get(mk)
+            same_name_qids = tgt_query_by_key.get(mk, [])
+            candidate_qids: List[int] = []
+            if mapped_qid_str:
+                candidate_qids.append(int(mapped_qid_str))
+            for qid in same_name_qids:
+                if qid not in candidate_qids:
+                    candidate_qids.append(qid)
 
-            tgt_qid = int(tgt_qid_str)
+            if not candidate_qids:
+                counts["query_missing"] += 1
+                csv_rows.append({**row_base, "status": "NO_QUERY", "query_name": name,
+                                 "language": lang, "group": group, "target_path_id": "",
+                                 "target_similarity_id": "", "computed_similarity_id": "",
+                                 "detail": "Query not in mapping.json and not found in target"})
+                continue
 
             # Optionally compute new SimilarityId via SimilarityCalculator.exe
             computed_sim = ""
@@ -809,76 +806,115 @@ def process_project(
                     sim_exe,
                     src_path, orig["SourceObject"], str(orig["SourceLine"]),
                     dst_path, orig["DestObject"],   str(orig["DestLine"]),
-                    tgt_qid_str, args.sim_version,
+                    str(candidate_qids[0]), args.sim_version,
                 ) or ""
 
-            # Match by path nodes
-            dest = match_result(orig, tgt_by_query.get(tgt_qid, []))
+            # Match by path nodes, trying each candidate QueryId in order
+            dest = None
+            tgt_qid = candidate_qids[0]
+            tried = []
+            for qid in candidate_qids:
+                qid_candidates = tgt_by_query.get(qid, [])
+                tried.append((qid, len(qid_candidates)))
+                m = match_result(orig, qid_candidates)
+                if m is not None:
+                    dest = m
+                    tgt_qid = qid
+                    break
+
             if dest is None:
                 counts["not_found"] += 1
+                tried_str = ", ".join(f"QueryId={q} ({n} result(s))" for q, n in tried)
+                detail = f"No matching result found in target scan; tried {tried_str}"
                 csv_rows.append({**row_base, "status": "NOT_FOUND", "query_name": name,
                                  "language": lang, "group": group, "target_path_id": "",
                                  "target_similarity_id": "", "computed_similarity_id": computed_sim,
-                                 "detail": "No matching result found in target scan"})
-                print(f"  NOT FOUND  [{src_qid}→{tgt_qid}] {lang}/{name} "
-                      f"src={orig['SourceFile']}:{orig['SourceLine']} "
-                      f"dst={orig['DestFile']}:{orig['DestLine']}")
+                                 "detail": detail})
+                print(f"  NOT FOUND  [{src_qid}] {lang}/{name} tried={tried_str} "
+                      f"src={orig['SourceFile']}:{orig['SourceLine']}:{orig['SourceObject']} "
+                      f"dst={orig['DestFile']}:{orig['DestLine']}:{orig['DestObject']} nodes={orig['NumberOfNodes']}")
+                for qid, _ in tried:
+                    sample = tgt_by_query.get(qid, [])
+                    if sample:
+                        c = sample[0]
+                        print(f"    sample target candidate (QueryId={qid}): "
+                              f"src={c['SourceFile']}:{c['SourceLine']}:{c['SourceObject']} "
+                              f"dst={c['DestFile']}:{c['DestLine']}:{c['DestObject']} nodes={c['NumberOfNodes']}")
                 continue
+
+            if len(candidate_qids) > 1 and tgt_qid != candidate_qids[0]:
+                print(f"  NOTE: [{src_qid}] {lang}/{name} matched via fallback QueryId={tgt_qid} "
+                      f"(mapping.json/first candidate {candidate_qids[0]} had no match)")
 
             counts["matched"] += 1
             validation_map[dest["PathId"]] = orig["PathId"]
             dest_sim = tgt_sim_map.get(dest["PathId"], "")
-            base_triage = {
-                "projectId": tgt_project["Id"],
-                "scanId":    tgt_scan_id,
-                "PathId":    dest["PathId"],
-            }
+            base_label = {"pathId": dest["PathId"]}
 
-            # Comments: fetch full history and add any entries missing from target
+            # Comment: fetch full history and build one consolidated string containing
+            # any source entries missing from the target (existing proven mechanism).
+            # Attached to the LAST label call below rather than per history step, since
+            # we can't reliably tell which ResultTriageHistories entry (if any) the
+            # comment text actually belongs to.
             src_cmts: List[str] = []
+            missing_cmt = ""
             if orig["Comment"]:
                 src_cmts = get_path_comments(source_env, src_scan_id, orig["PathId"])
                 tgt_cmts = (get_path_comments(target_env, tgt_scan_id, dest["PathId"])
                             if dest["Comment"] else [])
-                missing_cmt = _build_missing_comment(src_cmts, tgt_cmts)
-                if missing_cmt:
-                    comments.append({**base_triage, "ResultLabelType": LABEL_COMMENT,
-                                     "Remarks": missing_cmt, "data": missing_cmt})
+                missing_cmt = _build_missing_comment(src_cmts, tgt_cmts) or ""
 
-            # State/severity/assignee: replay every historical change in order if OData
-            # history is available; otherwise fall back to applying the final state only.
+            # State/severity/assignee: replay every historical change in order via
+            # PATCH .../results/{pathId}/labels (one call per step) if OData history
+            # is available; otherwise fall back to applying the final values only.
+            # Each call includes ONLY the field(s) that actually changed at that step —
+            # the target logs a distinct audit entry for every field present in the
+            # request, even when its value matches what's already there, so sending
+            # severity/userAssignment unconditionally produces spurious "Changed
+            # severity"/"Assigned to None" entries.
+            result_calls: List[dict] = []
             path_history = src_triage_hist.get(orig["PathId"], [])
             if path_history:
-                prev_state = 0
-                prev_sev   = -1
-                prev_user  = ""
+                prev_state = dest["State"]
+                prev_sev   = dest["Severity"]
+                prev_user  = dest["AssignedUser"] or ""
                 for entry in path_history:
-                    e_state = entry.get("State") or 0
-                    e_sev   = entry.get("Severity") if entry.get("Severity") is not None else -1
+                    e_state = entry.get("State")
+                    e_sev   = entry.get("Severity")
                     e_user  = entry.get("AssignedToUser") or entry.get("AssignedUser") or ""
-                    if e_state and e_state != prev_state:
-                        states.append({**base_triage, "ResultLabelType": LABEL_STATE,
-                                       "Remarks": None, "data": e_state})
+                    call = {}
+                    if e_state is not None and e_state != prev_state:
                         prev_state = e_state
-                    if e_sev >= 0 and e_sev != prev_sev:
-                        severities.append({**base_triage, "ResultLabelType": LABEL_SEVERITY,
-                                           "Remarks": None, "data": e_sev})
+                        call["state"] = prev_state
+                    if e_sev is not None and e_sev != prev_sev:
                         prev_sev = e_sev
+                        call["severity"] = prev_sev
                     if e_user and e_user != prev_user:
-                        assignees.append({**base_triage, "ResultLabelType": LABEL_ASSIGNEE,
-                                          "Remarks": None, "data": e_user})
                         prev_user = e_user
+                        call["userAssignment"] = prev_user
+                    if call:
+                        result_calls.append({**base_label, **call, "comment": ""})
             else:
-                # Fallback: apply final state only
+                # Fallback: apply final values only
+                call = {}
                 if orig["State"] > 0 and orig["State"] != dest["State"]:
-                    states.append({**base_triage, "ResultLabelType": LABEL_STATE,
-                                   "Remarks": None, "data": orig["State"]})
+                    call["state"] = orig["State"]
                 if orig["Severity"] != dest["Severity"]:
-                    severities.append({**base_triage, "ResultLabelType": LABEL_SEVERITY,
-                                       "Remarks": None, "data": orig["Severity"]})
+                    call["severity"] = orig["Severity"]
                 if orig["AssignedUser"] and orig["AssignedUser"] != dest["AssignedUser"]:
-                    assignees.append({**base_triage, "ResultLabelType": LABEL_ASSIGNEE,
-                                      "Remarks": None, "data": orig["AssignedUser"]})
+                    call["userAssignment"] = orig["AssignedUser"]
+                if call:
+                    result_calls.append({**base_label, **call, "comment": ""})
+
+            # Attach the consolidated comment to the last call so it's always sent,
+            # adding a comment-only call (no state/severity/assignee) if nothing else changed.
+            if missing_cmt:
+                if result_calls:
+                    result_calls[-1]["comment"] = missing_cmt
+                else:
+                    result_calls.append({**base_label, "comment": missing_cmt})
+
+            label_calls.extend(result_calls)
 
             full_comment = "ÿ".join(src_cmts) if src_cmts else orig["Comment"]
             csv_rows.append({**row_base, "status": "MATCHED", "query_name": name,
@@ -898,7 +934,7 @@ def process_project(
         # UPLOAD
         # -----------------------------------------------------------------------
         print(f"\n=== Uploading triages for project [{src_project['Id']}] ===")
-        upload_all_triages(target_env, comments, assignees, severities, states, args.dry_run)
+        upload_label_calls(target_env, tgt_scan_id, label_calls, args.dry_run)
 
         if not args.dry_run and validation_map:
             print(f"\n=== Validating {len(validation_map)} uploaded triage(s) against source snapshot ===")
@@ -1016,10 +1052,25 @@ def main():
     tgt_queries = get_query_collection(target_env)
     print(f"  {len(tgt_queries)} queries")
 
-    tgt_query_by_key: Dict[tuple, int] = {}
+    # Map each (language, group, name) key to ALL matching target QueryIds, not just
+    # one — the same query name can exist multiple times in the target's query
+    # collection (e.g. a custom query overridden per-team/per-project), each copy
+    # with its own QueryId. Picking the wrong one silently yields zero scan results
+    # for that query even though the name "matches".
+    tgt_query_by_key: Dict[tuple, List[int]] = {}
     for qid, qi in tgt_queries.items():
         key = (qi["LanguageName"].strip(), qi["PackageName"].strip(), qi["Name"].strip())
-        tgt_query_by_key[key] = qid
+        tgt_query_by_key.setdefault(key, []).append(qid)
+
+    for key, qids in tgt_query_by_key.items():
+        if len(qids) > 1:
+            details = ", ".join(
+                f"QueryId={q} OwningTeam={tgt_queries[q].get('OwningTeam')} "
+                f"ProjectId={tgt_queries[q].get('ProjectId')}"
+                for q in qids
+            )
+            print(f"  WARNING: target has {len(qids)} queries named {key!r}: {details}",
+                  file=sys.stderr)
 
     all_csv_rows: List[dict] = []
     total_counts = {"matched": 0, "not_found": 0, "query_missing": 0, "error": 0}

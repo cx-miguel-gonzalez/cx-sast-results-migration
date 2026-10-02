@@ -88,13 +88,25 @@ def get_all_queries(client: Client) -> list[dict]:
     return queries
 
 
-def build_index(queries: list[dict]) -> dict[tuple, int]:
-    """Key: (LanguageName, GroupName, QueryName) -> QueryId."""
+def build_index(queries: list[dict], label: str) -> dict[tuple, int]:
+    """
+    Key: (LanguageName, GroupName, QueryName) -> QueryId.
+
+    The same name can appear more than once (e.g. a custom query overridden
+    per-team/per-project, each copy with its own QueryId) — last one wins,
+    which is arbitrary, so duplicates are reported for visibility.
+    """
     index = {}
+    seen: dict[tuple, list[int]] = {}
     for q in queries:
         key = (q["LanguageName"].strip(), q["GroupName"].strip(), q["Name"].strip())
         if all(key):
             index[key] = q["QueryId"]
+            seen.setdefault(key, []).append(q["QueryId"])
+    for key, qids in seen.items():
+        if len(qids) > 1:
+            print(f"  WARNING: {label} has {len(qids)} queries named {key!r}: QueryIds={qids} "
+                  f"— mapping.json will use QueryId={index[key]} (last one found)", file=sys.stderr)
     return index
 
 
@@ -143,8 +155,8 @@ def main():
     target_queries = get_all_queries(target_client)
     print(f"  Found {len(target_queries)} queries in target")
 
-    source_index = build_index(source_queries)
-    target_index = build_index(target_queries)
+    source_index = build_index(source_queries, "source")
+    target_index = build_index(target_queries, "target")
 
     mappings = []
     unmatched_source = []
