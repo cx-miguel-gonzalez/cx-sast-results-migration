@@ -28,6 +28,8 @@ import csv
 import json
 import os
 import platform
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -69,6 +71,18 @@ CSV_FIELDS = [
     "source_path_id", "target_path_id",
     "source_similarity_id", "target_similarity_id", "computed_similarity_id",
     "source_state", "source_severity", "source_comment",
+    "detail",
+]
+
+COMPARE_CSV_FIELDS = [
+    "status",
+    "source_project_id", "source_scan_id",
+    "target_project_id", "target_scan_id",
+    "query_name", "language", "group",
+    "source_path_id", "target_path_id",
+    "source_similarity_id", "computed_similarity_id", "target_similarity_id",
+    "matches",
+    "Calculator_Command",
     "detail",
 ]
 
@@ -321,6 +335,7 @@ def get_results_soap(env: SastEnv, scan_id: int) -> list[dict]:
         raise ValueError(f"GetResultsForScan failed: {response.ErrorMessage}")
     if not response.Results or not response.Results.CxWSSingleResultData:
         return []
+
     return [
         {
             "QueryId":       item.QueryId,
@@ -342,6 +357,202 @@ def get_results_soap(env: SastEnv, scan_id: int) -> list[dict]:
         }
         for item in response.Results.CxWSSingleResultData
     ]
+
+
+def get_result_paths_for_query(env: SastEnv, scan_id: int, query_id: int) -> Dict[int, List[dict]]:
+    """
+    Fetch per-path node details (FileName, Name, Line, Column, MethodLine) for
+    every result of a single query via SOAP GetResultPathsForQuery.
+
+    Unlike other SOAP calls here, this operation takes no sessionId parameter.
+    Returns {PathId: [node_dict, ...]}, nodes ordered first-to-last along the
+    path — node[0] is the source node, node[-1] is the destination node. This
+    is the only source for Column/MethodLine; GetResultsForScan's SourceLine/
+    DestLine etc. don't include them.
+    """
+    response = env.soap.service.GetResultPathsForQuery(scanId=scan_id, queryId=query_id)
+    if not response.IsSuccesfull:
+        raise ValueError(f"GetResultPathsForQuery failed: {response.ErrorMessage}")
+    if not response.Paths or not response.Paths.CxWSResultPath:
+        return {}
+
+    result: Dict[int, List[dict]] = {}
+    for path in response.Paths.CxWSResultPath:
+        nodes = path.Nodes.CxWSPathNode if path.Nodes else []
+        result[path.PathId] = [
+            {
+                "FileName":   getattr(n, "FileName", "") or "",
+                "Name":       getattr(n, "Name", "") or "",
+                "Line":       getattr(n, "Line", None),
+                "Column":     getattr(n, "Column", None),
+                "MethodLine": getattr(n, "MethodLine", None),
+            }
+            for n in nodes
+        ]
+    return result
+
+
+def get_cached_path_nodes(
+    cache: Dict[int, Dict[int, List[dict]]], env: SastEnv, scan_id: int, query_id: int,
+) -> Dict[int, List[dict]]:
+    """Fetch get_result_paths_for_query() results once per query_id, reusing across results."""
+    if query_id not in cache:
+        try:
+            cache[query_id] = get_result_paths_for_query(env, scan_id, query_id)
+        except Exception as e:
+            print(f"  WARNING: GetResultPathsForQuery failed for QueryId={query_id}: {e}", file=sys.stderr)
+            cache[query_id] = {}
+    return cache[query_id]
+
+
+def get_source_dest_col_methodline(
+    cache: Dict[int, Dict[int, List[dict]]], env: SastEnv, scan_id: int, query_id: int, path_id: int,
+) -> Tuple[str, str, str, str]:
+    """
+    Return (source_col, source_method_line, dest_col, dest_method_line) for a
+    result's path, via the first/last entries of its GetResultPathsForQuery
+    node list. Falls back to "0" for any value that's missing (e.g. older
+    CxSAST versions without MethodLine data).
+    """
+    nodes = get_cached_path_nodes(cache, env, scan_id, query_id).get(path_id)
+    if not nodes:
+        return "0", "0", "0", "0"
+    first, last = nodes[0], nodes[-1]
+    return (
+        str(first.get("Column") or 0),
+        str(first.get("MethodLine") or 0),
+        str(last.get("Column") or 0),
+        str(last.get("MethodLine") or 0),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source file download (SimilarityCalculator.exe needs real file content on
+# disk, not just the recorded folder/filename string)
+# ---------------------------------------------------------------------------
+
+SOURCE_FILES_BATCH_SIZE = 10
+
+def normalize_remote_path(folder: str, filename: str) -> str:
+    """
+    Build the remote path for GetSourcesByScanID from a result's
+    SourceFolder/SourceFile (or DestFolder/DestFile): plain backslash
+    concatenation, preserving SourceFolder's own natural leading backslash
+    (CxSAST's native convention for these fields) — no separator conversion,
+    no forced leading character. Confirmed live via a multi-variant probe:
+    content fetches successfully with this exact shape (and also with a
+    leading '/' substituted), while a form missing the folder component
+    entirely came back empty. The content-vs-empty signal is len(Source),
+    not the response's IsSuccesfull flag — see get_sources_by_scan_id.
+    """
+    folder = (folder or "").rstrip("\\")
+    filename = (filename or "").lstrip("\\")
+    return f"{folder}\\{filename}" if folder else f"\\{filename}"
+
+
+def get_sources_by_scan_id(env: SastEnv, scan_id: int, remote_paths: List[str]) -> Dict[str, str]:
+    """
+    Fetch raw source file content for a batch of files via SOAP
+    GetSourcesByScanID. `remote_paths` must already be normalized (see
+    normalize_remote_path). This operation takes no sessionId parameter.
+
+    Returns {remote_path: content}. The response has no per-file name field —
+    its order matches the request order — so this is the one place that pairs
+    them up; every other caller must go through here.
+    """
+    if not remote_paths:
+        return {}
+    # filesToRetreive is a wrapped complex type (GetSourcesFilesToRetrieve{Strings
+    # []string `xml:"chec:string"`} in the reference client), not a bare array —
+    # a plain Python list here was confirmed live to only submit one file out of
+    # many requested, so it must be wrapped to match that shape.
+    response = env.soap.service.GetSourcesByScanID(
+        scanID=scan_id, filesToRetreive={"string": remote_paths}
+    )
+    if not response.IsSuccesfull:
+        raise ValueError(f"GetSourcesByScanID failed: {response.ErrorMessage}")
+
+    contents = (
+        response.cxWSResponseSourcesContent.CxWSResponseSourceContent
+        if response.cxWSResponseSourcesContent else []
+    )
+
+    if len(contents) != len(remote_paths):
+        print(f"  WARNING: GetSourcesByScanID returned {len(contents)} item(s) for "
+              f"{len(remote_paths)} requested file(s) — response has no per-file name, "
+              f"so this batch's content-to-path pairing may be misaligned from here on",
+              file=sys.stderr)
+
+    # Per-item IsSuccesfull is NOT a reliable fetch-status flag — confirmed live
+    # via the path-format probe, content came back fully populated (len(Source)
+    # in the thousands) on items where IsSuccesfull was still False. The real
+    # signal for "this file wasn't found" is empty Source content.
+    result: Dict[str, str] = {}
+    for remote_path, item in zip(remote_paths, contents):
+        content = getattr(item, "Source", "") or ""
+        if not content:
+            print(f"  WARNING: GetSourcesByScanID returned no content for {remote_path!r} "
+                  f"(ErrorMessage={getattr(item, 'ErrorMessage', None)!r})", file=sys.stderr)
+            continue
+        result[remote_path] = content
+    return result
+
+
+def collect_needed_remote_paths(results: List[dict]) -> List[str]:
+    """Unique, normalized source+dest remote file paths needed across a set of results."""
+    seen = []
+    seen_set = set()
+    for r in results:
+        for folder_key, file_key in (("SourceFolder", "SourceFile"), ("DestFolder", "DestFile")):
+            if not r.get(file_key):
+                continue
+            remote_path = normalize_remote_path(r.get(folder_key, ""), r[file_key])
+            if remote_path not in seen_set:
+                seen_set.add(remote_path)
+                seen.append(remote_path)
+    return seen
+
+
+def download_source_files(
+    env: SastEnv, scan_id: int, remote_paths: List[str], local_root: str,
+) -> Dict[str, str]:
+    """
+    Download content for each remote_path via SOAP GetSourcesByScanID (batched,
+    matching the reference exporter's batch size) and write it to a local file
+    under local_root, mirroring its remote path. Returns {remote_path: local_path}
+    for every file successfully downloaded; files that fail are simply absent
+    (caller treats a missing local path as "can't compute similarity for this
+    result" rather than aborting the whole run).
+    """
+    local_paths: Dict[str, str] = {}
+    for i in range(0, len(remote_paths), SOURCE_FILES_BATCH_SIZE):
+        batch = remote_paths[i : i + SOURCE_FILES_BATCH_SIZE]
+        try:
+            contents = get_sources_by_scan_id(env, scan_id, batch)
+        except Exception as e:
+            print(f"  WARNING: GetSourcesByScanID failed for batch starting {batch[0]!r}: {e}",
+                  file=sys.stderr)
+            continue
+        local_root_abs = os.path.abspath(local_root)
+        for remote_path, content in contents.items():
+            # remote_path is backslash-separated (CxSAST's own convention); convert
+            # to forward slashes so os.path.join builds a proper nested directory
+            # structure regardless of the host OS's separator.
+            local_rel = remote_path.replace("\\", "/").lstrip("/")
+            local_path = os.path.normpath(os.path.join(local_root_abs, local_rel))
+            if local_path != local_root_abs and not local_path.startswith(local_root_abs + os.sep):
+                print(f"  WARNING: refusing to write outside download dir for remote path "
+                      f"{remote_path!r} (resolved to {local_path!r})", file=sys.stderr)
+                continue
+            try:
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                with open(local_path, "w", encoding="utf-8", errors="replace") as f:
+                    f.write(content)
+                local_paths[remote_path] = local_path
+            except OSError as e:
+                print(f"  WARNING: could not write local source file {local_path!r}: {e}",
+                      file=sys.stderr)
+    return local_paths
 
 
 def get_similarity_map(env: SastEnv, scan_id: int) -> dict[int, str]:
@@ -395,37 +606,50 @@ def load_mapping(mapping_file: str) -> dict[tuple, str]:
 # SimilarityCalculator.exe (Windows only, optional)
 # ---------------------------------------------------------------------------
 
-def run_similarity_calculator(
+def build_similarity_calculator_args(
     exe_path: str,
-    source_path: str, source_name: str, source_line: str,
-    dest_path: str,   dest_name: str,   dest_line: str,
-    target_query_id: str, sim_version: str = "0",
-) -> Optional[str]:
+    source_path: str, source_name: str, source_line: str, source_col: str, source_method_line: str,
+    dest_path: str,   dest_name: str,   dest_line: str,   dest_col: str,   dest_method_line: str,
+    target_query_id: str, sim_id_version: str = "0",
+) -> List[str]:
     """
-    Call SimilarityCalculator.exe to compute a new similarity ID.
+    Build the argv for SimilarityCalculator.exe. All 12 args are positional,
+    matching Checkmarx's own reference caller (sast-to-ast-export): filename,
+    name, line, col, methodline (x2 — source then dest), queryID,
+    simIdVersion. There is no `--simIdVersion` flag.
+    """
+    return [
+        exe_path,
+        source_path, source_name, source_line, source_col, source_method_line,
+        dest_path,   dest_name,   dest_line,   dest_col,   dest_method_line,
+        target_query_id,
+        sim_id_version,
+    ]
 
-    Windows only. Requires the source and destination files to exist locally.
-    Column and method line default to "0" as they are not available from
-    SOAP results alone.
+
+def format_calculator_command(argv: List[str]) -> str:
+    """Render an argv list as a copy-pasteable shell command for manual debugging."""
+    return shlex.join(argv)
+
+
+def run_similarity_calculator(argv: List[str]) -> Optional[str]:
+    """
+    Call SimilarityCalculator.exe (argv built by build_similarity_calculator_args)
+    to compute a new similarity ID. Windows only. Requires the source and
+    destination files to exist locally. Column/method-line come from the
+    source scan's own GetResultPathsForQuery node list (see
+    get_result_paths_for_query) — GetResultsForScan's SourceLine/DestLine etc.
+    don't include them.
 
     Returns the computed similarity ID string, or None on failure.
     """
     try:
-        result = subprocess.run(
-            [
-                exe_path,
-                source_path, source_name, source_line, "0", "0",   # file, name, line, col, methodline
-                dest_path,   dest_name,   dest_line,   "0", "0",   # file, name, line, col, methodline
-                target_query_id,
-                sim_version,
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
             return result.stdout.strip() or None
         print(f"  SimilarityCalculator returned exit {result.returncode}: {result.stderr.strip()}", file=sys.stderr)
     except FileNotFoundError:
-        print(f"  WARNING: SimilarityCalculator.exe not found at: {exe_path}", file=sys.stderr)
+        print(f"  WARNING: SimilarityCalculator.exe not found at: {argv[0]}", file=sys.stderr)
     except Exception as e:
         print(f"  WARNING: SimilarityCalculator failed: {e}", file=sys.stderr)
     return None
@@ -457,14 +681,18 @@ def _parse_comments(raw: str) -> List[str]:
 
 
 def get_path_comments(env: SastEnv, scan_id: int, path_id: int) -> List[str]:
-    """Return all individual comments for a result via SOAP GetPathCommentsHistory."""
+    """
+    Return all individual comments for a result via SOAP GetPathCommentsHistory,
+    newest first — CxSAST's raw comment field already stores entries in that
+    order (each new comment is prepended), and _parse_comments preserves it.
+    """
     try:
         resp = env.soap.service.GetPathCommentsHistory(
             sessionId="0", scanId=scan_id, pathId=path_id, labelType="Remark"
         )
         if not resp.IsSuccesfull or not resp.Path or not resp.Path.Comment:
             return []
-        return list(reversed(_parse_comments(resp.Path.Comment)))
+        return _parse_comments(resp.Path.Comment)
     except Exception as e:
         print(f"  WARNING: GetPathCommentsHistory failed for PathId={path_id}: {e}", file=sys.stderr)
         return []
@@ -474,6 +702,9 @@ def _build_missing_comment(src_comments: List[str], tgt_comments: List[str]) -> 
     """
     Return a consolidated comment string containing source comments absent from the
     target, or None if nothing is missing. Follows the synchronizer's format.
+    `src_comments` is newest-first (see get_path_comments), so the consolidated
+    block lists the newest migrated comment first too, matching CxSAST's own
+    display convention.
     """
     missing = [
         sc for sc in src_comments
@@ -568,6 +799,70 @@ def match_result(orig: dict, candidates: List[dict]) -> Optional[dict]:
         ):
             return dest
     return None
+
+
+def resolve_candidate_qids(
+    mk: tuple,
+    mapping: Dict[tuple, str],
+    tgt_query_by_key: Dict[tuple, List[int]],
+) -> List[int]:
+    """
+    Resolve candidate target QueryIds for a source result's query key `mk` —
+    mapping.json's choice first (if any), then every other target query
+    sharing this (language, group, name), since the same name can exist more
+    than once in the target (e.g. a custom query overridden per-team/
+    per-project), each copy with its own QueryId.
+    """
+    mapped_qid_str = mapping.get(mk)
+    same_name_qids = tgt_query_by_key.get(mk, [])
+    candidate_qids: List[int] = []
+    if mapped_qid_str:
+        candidate_qids.append(int(mapped_qid_str))
+    for qid in same_name_qids:
+        if qid not in candidate_qids:
+            candidate_qids.append(qid)
+    return candidate_qids
+
+
+def match_target_result(
+    orig: dict,
+    candidate_qids: List[int],
+    tgt_by_query: Dict[int, list],
+    tgt_sim_map: Optional[Dict[int, str]] = None,
+    computed_sim: str = "",
+) -> Tuple[Optional[dict], List[Tuple[int, int]], str]:
+    """
+    Try to match a source result to one target result among candidate_qids'
+    actual scan results.
+
+    If `computed_sim` (from SimilarityCalculator.exe) and `tgt_sim_map` are
+    given, tries a similarity-ID match first — comparing computed_sim against
+    each candidate's actual SimilarityId — since that's the purpose-built
+    CxSAST mechanism for identifying the same finding across scans, and is
+    preferred over the path-node heuristic (match_result) whenever available.
+    Callers that need path-node matching as independent ground truth (e.g.
+    validating the calculator itself) should omit computed_sim/tgt_sim_map.
+
+    Returns (dest_or_None, tried, match_method). `tried` is
+    [(queryId, candidate_count), ...] for every candidate attempted via the
+    path-node fallback (empty if a similarity-ID match was found first).
+    `match_method` is "similarity_id", "path_nodes", or "" if nothing matched.
+    """
+    if computed_sim and tgt_sim_map:
+        for qid in candidate_qids:
+            qid_candidates = tgt_by_query.get(qid, [])
+            for cand in qid_candidates:
+                if tgt_sim_map.get(cand["PathId"], "") == computed_sim:
+                    return cand, [(qid, len(qid_candidates))], "similarity_id"
+
+    tried: List[Tuple[int, int]] = []
+    for qid in candidate_qids:
+        qid_candidates = tgt_by_query.get(qid, [])
+        tried.append((qid, len(qid_candidates)))
+        m = match_result(orig, qid_candidates)
+        if m is not None:
+            return m, tried, "path_nodes"
+    return None, tried, ""
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +984,7 @@ def process_project(
     print("  Caching source triage snapshot (temp file)...")
     triage_temp_path = _write_source_triage_snapshot(src_project["Id"], src_scan_id, triaged_src)
     validation_map: Dict[int, int] = {}  # target PathId -> source PathId
+    source_files_dir: Optional[str] = None
 
     try:
         # -----------------------------------------------------------------------
@@ -737,12 +1033,23 @@ def process_project(
         for r in all_tgt_results:
             tgt_by_query.setdefault(r["QueryId"], []).append(r)
 
+        # Download real source file content for SimilarityCalculator.exe — it
+        # needs actual local files, not just the recorded folder/filename string.
+        local_source_files: Dict[str, str] = {}
+        if sim_exe:
+            remote_paths = collect_needed_remote_paths(triaged_src)
+            source_files_dir = tempfile.mkdtemp(prefix=f"simcalc_src_{src_scan_id}_")
+            print(f"  Downloading {len(remote_paths)} unique source file(s) for similarity calculation...")
+            local_source_files = download_source_files(source_env, src_scan_id, remote_paths, source_files_dir)
+            print(f"  Downloaded {len(local_source_files)}/{len(remote_paths)} files")
+
         # -----------------------------------------------------------------------
         # MATCH & COLLECT TRIAGES
         # -----------------------------------------------------------------------
         print(f"\n=== Matching {len(triaged_src)} triaged source results ===")
 
         label_calls: List[dict] = []
+        src_path_nodes_cache: Dict[int, Dict[int, List[dict]]] = {}
 
         for orig in triaged_src:
             src_qid   = orig["QueryId"]
@@ -774,20 +1081,9 @@ def process_project(
             name  = src_qinfo["Name"]
             mk    = (lang.strip(), group.strip(), name.strip())
 
-            # Resolve candidate target QueryIds: mapping.json's choice first (if any),
-            # then every other target query sharing this (language, group, name) — the
-            # same name can exist more than once in the target (e.g. a custom query
-            # overridden per-team/per-project), each copy with its own QueryId, and
-            # mapping.json only ever recorded one of them. Try each in turn and use
-            # whichever one actually has a matching result in this scan.
-            mapped_qid_str = mapping.get(mk)
-            same_name_qids = tgt_query_by_key.get(mk, [])
-            candidate_qids: List[int] = []
-            if mapped_qid_str:
-                candidate_qids.append(int(mapped_qid_str))
-            for qid in same_name_qids:
-                if qid not in candidate_qids:
-                    candidate_qids.append(qid)
+            # Resolve candidate target QueryId(s) — handles duplicate-named
+            # target queries, e.g. a custom query overridden per-team/per-project.
+            candidate_qids = resolve_candidate_qids(mk, mapping, tgt_query_by_key)
 
             if not candidate_qids:
                 counts["query_missing"] += 1
@@ -797,30 +1093,34 @@ def process_project(
                                  "detail": "Query not in mapping.json and not found in target"})
                 continue
 
-            # Optionally compute new SimilarityId via SimilarityCalculator.exe
+            # Optionally compute new SimilarityId via SimilarityCalculator.exe.
+            # When available, this drives matching itself (see below) — the
+            # purpose-built mechanism for identifying the same finding across
+            # scans, preferred over the path-node heuristic.
             computed_sim = ""
             if sim_exe:
-                src_path = os.path.join(orig["SourceFolder"], orig["SourceFile"]) if orig["SourceFolder"] else orig["SourceFile"]
-                dst_path = os.path.join(orig["DestFolder"],   orig["DestFile"])   if orig["DestFolder"]   else orig["DestFile"]
-                computed_sim = run_similarity_calculator(
-                    sim_exe,
-                    src_path, orig["SourceObject"], str(orig["SourceLine"]),
-                    dst_path, orig["DestObject"],   str(orig["DestLine"]),
-                    str(candidate_qids[0]), args.sim_version,
-                ) or ""
+                src_local = local_source_files.get(normalize_remote_path(orig["SourceFolder"], orig["SourceFile"]))
+                dst_local = local_source_files.get(normalize_remote_path(orig["DestFolder"], orig["DestFile"]))
+                if not src_local or not dst_local:
+                    print(f"  WARNING: source file(s) not downloaded for PathId={orig['PathId']} "
+                          f"— skipping similarity calculation", file=sys.stderr)
+                else:
+                    src_col, src_method_line, dst_col, dst_method_line = get_source_dest_col_methodline(
+                        src_path_nodes_cache, source_env, src_scan_id, src_qid, orig["PathId"]
+                    )
+                    calc_argv = build_similarity_calculator_args(
+                        sim_exe,
+                        src_local, orig["SourceObject"], str(orig["SourceLine"]), src_col, src_method_line,
+                        dst_local, orig["DestObject"],   str(orig["DestLine"]),   dst_col, dst_method_line,
+                        str(candidate_qids[0]), args.sim_version,
+                    )
+                    computed_sim = run_similarity_calculator(calc_argv) or ""
 
-            # Match by path nodes, trying each candidate QueryId in order
-            dest = None
-            tgt_qid = candidate_qids[0]
-            tried = []
-            for qid in candidate_qids:
-                qid_candidates = tgt_by_query.get(qid, [])
-                tried.append((qid, len(qid_candidates)))
-                m = match_result(orig, qid_candidates)
-                if m is not None:
-                    dest = m
-                    tgt_qid = qid
-                    break
+            # Match by computed similarity ID first (if available), falling
+            # back to the path-node heuristic otherwise.
+            dest, tried, match_method = match_target_result(
+                orig, candidate_qids, tgt_by_query, tgt_sim_map=tgt_sim_map, computed_sim=computed_sim
+            )
 
             if dest is None:
                 counts["not_found"] += 1
@@ -842,7 +1142,11 @@ def process_project(
                               f"dst={c['DestFile']}:{c['DestLine']}:{c['DestObject']} nodes={c['NumberOfNodes']}")
                 continue
 
-            if len(candidate_qids) > 1 and tgt_qid != candidate_qids[0]:
+            if match_method == "similarity_id":
+                print(f"  NOTE: [{src_qid}] {lang}/{name} matched via computed similarity ID "
+                      f"(PathId={dest['PathId']})")
+            tgt_qid = tried[-1][0] if tried else candidate_qids[0]
+            if match_method == "path_nodes" and len(candidate_qids) > 1 and tgt_qid != candidate_qids[0]:
                 print(f"  NOTE: [{src_qid}] {lang}/{name} matched via fallback QueryId={tgt_qid} "
                       f"(mapping.json/first candidate {candidate_qids[0]} had no match)")
 
@@ -966,6 +1270,197 @@ def process_project(
         return csv_rows, counts, True, False
     finally:
         os.remove(triage_temp_path)
+        if source_files_dir:
+            shutil.rmtree(source_files_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Similarity comparison (--compare-triages)
+# ---------------------------------------------------------------------------
+
+def compare_project_similarity(
+    project_input: str,
+    source_env: SastEnv,
+    target_env: SastEnv,
+    src_queries: dict,
+    tgt_queries: dict,
+    tgt_query_by_key: Dict[tuple, List[int]],
+    mapping: dict,
+    sim_exe: str,
+    args,
+) -> Tuple[List[dict], Dict[str, int], bool]:
+    """
+    Compare SimilarityCalculator.exe's computed target similarity IDs against
+    what's actually present in the target scan, for every result in a
+    project's latest scans (not just triaged ones). Read-only — makes no
+    changes to either environment.
+
+    Returns (csv_rows, counts, ok).
+    """
+    counts = {"matched": 0, "not_found": 0, "query_missing": 0, "error": 0}
+    csv_rows: List[dict] = []
+    src_path_nodes_cache: Dict[int, Dict[int, List[dict]]] = {}
+    source_files_dir: Optional[str] = None
+
+    print(f"\n=== SOURCE ({source_env.url}) ===")
+    print(f"Finding project: {project_input!r}")
+    src_project = get_project(source_env, project_input)
+    if not src_project:
+        print(f"ERROR: Project {project_input!r} not found in source.", file=sys.stderr)
+        return csv_rows, counts, False
+    print(f"  [{src_project['Id']}] {src_project.get('_FullName') or src_project['Name']}")
+
+    src_scan_id = get_latest_scan(source_env, src_project["Id"])
+    if not src_scan_id:
+        print("ERROR: No finished scans in source project.", file=sys.stderr)
+        return csv_rows, counts, False
+    print(f"  Latest finished scan: {src_scan_id}")
+
+    print("  Loading scan results (SOAP)...")
+    all_src_results = get_results_soap(source_env, src_scan_id)
+    print(f"  {len(all_src_results)} total results")
+
+    print("  Loading SimilarityIds (OData)...")
+    src_sim_map = get_similarity_map(source_env, src_scan_id)
+    print(f"  {len(src_sim_map)} similarity IDs")
+
+    print(f"\n=== TARGET ({target_env.url}) ===")
+    src_full_name = src_project.get("_FullName") or src_project["Name"]
+    print(f"Finding project by name: {src_full_name!r}")
+    tgt_project = get_project(target_env, src_full_name)
+    if not tgt_project:
+        print(f"ERROR: Project {src_full_name!r} not found in target.", file=sys.stderr)
+        return csv_rows, counts, False
+    print(f"  [{tgt_project['Id']}] {tgt_project.get('_FullName') or tgt_project['Name']}")
+
+    tgt_scan_id = get_latest_scan(target_env, tgt_project["Id"])
+    if not tgt_scan_id:
+        print("ERROR: No finished scans in target project.", file=sys.stderr)
+        return csv_rows, counts, False
+    print(f"  Latest finished scan: {tgt_scan_id}")
+
+    print("  Loading scan results (SOAP)...")
+    all_tgt_results = get_results_soap(target_env, tgt_scan_id)
+    print(f"  {len(all_tgt_results)} total results")
+
+    print("  Loading SimilarityIds (OData)...")
+    tgt_sim_map = get_similarity_map(target_env, tgt_scan_id)
+    print(f"  {len(tgt_sim_map)} similarity IDs")
+
+    tgt_by_query: Dict[int, list] = {}
+    for r in all_tgt_results:
+        tgt_by_query.setdefault(r["QueryId"], []).append(r)
+
+    # Download real source file content for SimilarityCalculator.exe — it
+    # needs actual local files, not just the recorded folder/filename string.
+    remote_paths = collect_needed_remote_paths(all_src_results)
+    source_files_dir = tempfile.mkdtemp(prefix=f"simcalc_src_{src_scan_id}_")
+    print(f"  Downloading {len(remote_paths)} unique source file(s) for similarity calculation...")
+    local_source_files = download_source_files(source_env, src_scan_id, remote_paths, source_files_dir)
+    print(f"  Downloaded {len(local_source_files)}/{len(remote_paths)} files")
+
+    try:
+        print(f"\n=== Comparing similarity IDs for {len(all_src_results)} source results ===")
+
+        matches_count = 0
+        mismatches_count = 0
+
+        for orig in all_src_results:
+            src_qid   = orig["QueryId"]
+            src_qinfo = src_queries.get(src_qid)
+            src_sim   = src_sim_map.get(orig["PathId"], "")
+
+            row_base = {
+                "source_project_id": src_project["Id"],
+                "source_scan_id":    src_scan_id,
+                "target_project_id": tgt_project["Id"],
+                "target_scan_id":    tgt_scan_id,
+                "query_name": "", "language": "", "group": "",
+                "source_path_id":    orig["PathId"],
+                "target_path_id":    "",
+                "source_similarity_id": src_sim,
+                "computed_similarity_id": "",
+                "target_similarity_id": "",
+                "matches": "",
+                "Calculator_Command": "",
+            }
+
+            if not src_qinfo:
+                counts["error"] += 1
+                csv_rows.append({**row_base, "status": "ERROR",
+                                 "detail": f"Source QueryId {src_qid} not in query collection"})
+                continue
+
+            lang  = src_qinfo["LanguageName"]
+            group = src_qinfo["PackageName"]
+            name  = src_qinfo["Name"]
+            mk    = (lang.strip(), group.strip(), name.strip())
+            row_base.update({"query_name": name, "language": lang, "group": group})
+
+            # Path-node matching only here (no computed_sim/tgt_sim_map) — this
+            # mode's whole point is validating the calculator independently,
+            # so it can't also use the calculator's own output to decide matches.
+            candidate_qids = resolve_candidate_qids(mk, mapping, tgt_query_by_key)
+            dest, tried, _match_method = match_target_result(orig, candidate_qids, tgt_by_query)
+
+            if not candidate_qids:
+                counts["query_missing"] += 1
+                csv_rows.append({**row_base, "status": "NO_QUERY",
+                                 "detail": "Query not in mapping.json and not found in target"})
+                continue
+
+            src_local = local_source_files.get(normalize_remote_path(orig["SourceFolder"], orig["SourceFile"]))
+            dst_local = local_source_files.get(normalize_remote_path(orig["DestFolder"], orig["DestFile"]))
+            computed_sim = ""
+            if not src_local or not dst_local:
+                print(f"  WARNING: source file(s) not downloaded for PathId={orig['PathId']} "
+                      f"— skipping similarity calculation", file=sys.stderr)
+            else:
+                src_col, src_method_line, dst_col, dst_method_line = get_source_dest_col_methodline(
+                    src_path_nodes_cache, source_env, src_scan_id, src_qid, orig["PathId"]
+                )
+                calc_argv = build_similarity_calculator_args(
+                    sim_exe,
+                    src_local, orig["SourceObject"], str(orig["SourceLine"]), src_col, src_method_line,
+                    dst_local, orig["DestObject"],   str(orig["DestLine"]),   dst_col, dst_method_line,
+                    str(candidate_qids[0]), args.sim_version,
+                )
+                row_base["Calculator_Command"] = format_calculator_command(calc_argv)
+                computed_sim = run_similarity_calculator(calc_argv) or ""
+            row_base["computed_similarity_id"] = computed_sim
+
+            if dest is None:
+                counts["not_found"] += 1
+                tried_str = ", ".join(f"QueryId={q} ({n} result(s))" for q, n in tried)
+                csv_rows.append({**row_base, "status": "NOT_FOUND", "matches": "False",
+                                 "detail": f"No matching result found in target scan; tried {tried_str}"})
+                continue
+
+            counts["matched"] += 1
+            target_sim = tgt_sim_map.get(dest["PathId"], "")
+            matches = bool(computed_sim) and computed_sim == target_sim
+            if matches:
+                matches_count += 1
+            else:
+                mismatches_count += 1
+
+            csv_rows.append({**row_base, "status": "MATCHED",
+                             "target_path_id": dest["PathId"],
+                             "target_similarity_id": target_sim,
+                             "matches": str(matches),
+                             "detail": ""})
+
+        print(f"  Matched:             {counts['matched']}")
+        print(f"    Similarity OK:       {matches_count}")
+        print(f"    Similarity MISMATCH: {mismatches_count}")
+        print(f"  Not found:           {counts['not_found']}")
+        print(f"  Query missing:       {counts['query_missing']}")
+        print(f"  Errors:              {counts['error']}")
+
+        return csv_rows, counts, True
+    finally:
+        if source_files_dir:
+            shutil.rmtree(source_files_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -983,17 +1478,34 @@ def main():
                         help="Comma-separated list of source project names or numeric IDs to migrate")
     parser.add_argument("--mapping",  default=os.getenv("MAPPING_FILE", "mapping.json"),
                         help="Path to query mapping JSON (default: mapping.json)")
-    parser.add_argument("--output",   default="triage_migration.csv",
-                        help="Output CSV file (default: triage_migration.csv)")
+    parser.add_argument("--output",   default=None,
+                        help="Output CSV file (default: triage_migration.csv, or "
+                             "similarity_comparison.csv with --compare-triages)")
     parser.add_argument("--similarity-calculator", default=None, metavar="EXE",
-                        help="Path to SimilarityCalculator.exe (Windows only, optional). "
-                             "Computes target similarity IDs from source path node data + "
-                             "mapped target query IDs.")
-    parser.add_argument("--sim-version", default="0", choices=["0", "1", "2"],
-                        help="SimilarityCalculator version argument (default: 0)")
+                        help="Path to SimilarityCalculator.exe (Windows only). Computes target "
+                             "similarity IDs from source path node data + mapped target query "
+                             "IDs. Optional in the default mode; required with --compare-triages.")
+    parser.add_argument("--sim-version", default=os.getenv("SIM_ID_VERSION", "0"), choices=["0", "1", "2"],
+                        help="Value passed to SimilarityCalculator.exe's --simIdVersion flag: "
+                             "0, 1, or 2 (default: 0, or the SIM_ID_VERSION environment variable)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch and match everything but skip uploading triages")
+    parser.add_argument("--compare-triages", action="store_true",
+                        help="Read-only mode: for every result in each project's latest scans "
+                             "(not just triaged ones), compute the target similarity ID via "
+                             "SimilarityCalculator.exe and compare it against the target scan's "
+                             "actual similarity ID. Writes a CSV with source/computed/target "
+                             "similarity IDs and a matches column. Makes no changes to either "
+                             "environment; requires --similarity-calculator.")
     args = parser.parse_args()
+
+    # argparse's `choices` only validates values passed on the command line, not
+    # the default — so a bad SIM_ID_VERSION env var would otherwise pass through
+    # silently and only fail once SimilarityCalculator.exe itself rejects it.
+    if args.sim_version not in ("0", "1", "2"):
+        print(f"ERROR: Invalid SIM_ID_VERSION/--sim-version value: {args.sim_version!r} "
+              f"(must be 0, 1, or 2)", file=sys.stderr)
+        sys.exit(1)
 
     def require_env(var: str, label: str) -> str:
         val = os.getenv(var, "").strip()
@@ -1030,6 +1542,15 @@ def main():
         elif not os.path.isfile(sim_exe):
             print(f"WARNING: SimilarityCalculator.exe not found: {sim_exe}", file=sys.stderr)
             sim_exe = None
+
+    if args.compare_triages and not sim_exe:
+        print("ERROR: --compare-triages requires a working --similarity-calculator "
+              "(SimilarityCalculator.exe, Windows only) — see warnings above.", file=sys.stderr)
+        sys.exit(1)
+
+    output_path = args.output or (
+        "similarity_comparison.csv" if args.compare_triages else "triage_migration.csv"
+    )
 
     source_env = SastEnv(source_url, source_user, source_pass, verify_ssl)
     target_env = SastEnv(target_url, target_user, target_pass, verify_ssl)
@@ -1077,6 +1598,45 @@ def main():
     failed_projects: List[str] = []
     skipped_projects: List[str] = []
 
+    if args.compare_triages:
+        for i, project_input in enumerate(projects, 1):
+            if len(projects) > 1:
+                print(f"\n{'#' * 70}\n# Project {i}/{len(projects)}: {project_input}\n{'#' * 70}")
+
+            csv_rows, counts, ok = compare_project_similarity(
+                project_input, source_env, target_env,
+                src_queries, tgt_queries, tgt_query_by_key,
+                mapping, sim_exe, args,
+            )
+            if not ok:
+                failed_projects.append(project_input)
+            all_csv_rows.extend(csv_rows)
+            for k in total_counts:
+                total_counts[k] += counts[k]
+
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=COMPARE_CSV_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(all_csv_rows)
+
+        matches_total = sum(1 for r in all_csv_rows if r.get("matches") == "True")
+        mismatches_total = sum(1 for r in all_csv_rows if r.get("matches") == "False")
+
+        print(f"\nCSV written to: {output_path}")
+        print(f"  Matched:             {total_counts['matched']}")
+        print(f"    Similarity OK:       {matches_total}")
+        print(f"    Similarity MISMATCH: {mismatches_total}")
+        print(f"  Not found:           {total_counts['not_found']}")
+        print(f"  Query missing:       {total_counts['query_missing']}")
+        print(f"  Errors:              {total_counts['error']}")
+        if failed_projects:
+            print(f"  Failed projects (not found / no scans): {', '.join(failed_projects)}", file=sys.stderr)
+
+        print("\nDone.")
+        if failed_projects:
+            sys.exit(1)
+        return
+
     for i, project_input in enumerate(projects, 1):
         if len(projects) > 1:
             print(f"\n{'#' * 70}\n# Project {i}/{len(projects)}: {project_input}\n{'#' * 70}")
@@ -1097,12 +1657,12 @@ def main():
     # -----------------------------------------------------------------------
     # CSV
     # -----------------------------------------------------------------------
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_csv_rows)
 
-    print(f"\nCSV written to: {args.output}")
+    print(f"\nCSV written to: {output_path}")
     print(f"  Matched:       {total_counts['matched']}")
     print(f"  Not found:     {total_counts['not_found']}")
     print(f"  Query missing: {total_counts['query_missing']}")
