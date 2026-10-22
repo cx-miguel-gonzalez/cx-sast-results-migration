@@ -98,7 +98,7 @@ The script will:
 | `--similarity-calculator PATH` | *(none)* | Path to `SimilarityCalculator.exe` (Windows only; optional normally, **required** with `--compare-triages`) |
 | `--sim-version 0\|1\|2` | `0` (or `SIM_ID_VERSION` env var) | Version value passed as `SimilarityCalculator.exe`'s final positional argument |
 | `--dry-run` | *(off)* | Fetch and match everything but skip uploading any changes |
-| `--compare-triages` | *(off)* | Read-only mode — compare computed vs. actual target similarity IDs instead of migrating triage data (see below) |
+| `--compare-triages` | *(off)* | Read-only mode — confirm every source result can be found in the target instead of migrating triage data (see below) |
 
 ### Example — dry run first
 
@@ -147,9 +147,9 @@ If a project in the list can't be found (or has no finished scans), the script l
 
 ---
 
-## `--compare-triages` (similarity ID comparison)
+## `--compare-triages` (coverage check)
 
-A read-only diagnostic mode that checks whether `SimilarityCalculator.exe` reproduces the similarity IDs CxSAST actually assigned in the target scan — useful for validating the calculator setup before trusting it to compute similarity IDs during a real migration. It makes **no changes** to either environment.
+A read-only mode that confirms every result in a project's latest source scan (not just triaged ones) can actually be found in the target scan — by computing each one's target similarity ID via `SimilarityCalculator.exe` and matching it the same way the real migration does. It makes **no changes** to either environment.
 
 ```bash
 python3 migrate_triages.py --project "CxServer\MyProject" --compare-triages --similarity-calculator C:\path\to\SimilarityCalculator.exe
@@ -157,25 +157,33 @@ python3 migrate_triages.py --project "CxServer\MyProject" --compare-triages --si
 
 For every result in each project's latest scans (not just triaged ones — the full scan, to give the broadest possible check), it:
 
-1. Pulls similarity IDs from the source scan (OData).
+1. Pulls similarity IDs from the source and target scans (OData).
 2. Resolves the matching target query (via `mapping.json`, with the same duplicate-query fallback used in the main migration) and computes a target similarity ID with `SimilarityCalculator.exe`.
-3. Pulls similarity IDs from the target scan (OData) and pairs each source result with its target counterpart using the same path-node matching (`match_result`) the main migration uses.
-4. Writes a CSV comparing all three IDs.
+3. Matches each source result to a target result **by computed similarity ID first, falling back to path-node comparison** (`match_target_result`) — identical priority to the real migration, so this report reflects what a real run would actually do.
+4. Writes a CSV with one `status` per row, instead of a separate `status`/`matches` pair.
 
-`--similarity-calculator` is **required** for this mode (the whole point is to validate it) and is still Windows-only.
+`--similarity-calculator` is **required** for this mode (there's nothing to compute a similarity ID with otherwise) and is still Windows-only.
 
 ### Comparison CSV columns
 
 | Column | Description |
 |--------|-------------|
-| `status` | `MATCHED`, `NOT_FOUND`, `NO_QUERY`, or `ERROR` |
+| `status` | `MATCHED`, `SIMILARITY_MISMATCH`, `NOT_FOUND`, `NO_QUERY`, or `ERROR` — see below |
 | `source_similarity_id` | Similarity ID from the source scan (OData) |
 | `computed_similarity_id` | Similarity ID computed by `SimilarityCalculator.exe` from the source's path node data + resolved target query ID |
 | `target_similarity_id` | Similarity ID actually present on the matched target result (OData) |
-| `matches` | `True` if `computed_similarity_id` equals `target_similarity_id` (and a computed ID was produced), `False` otherwise |
-| `Calculator_Command` | The exact `SimilarityCalculator.exe` command run for this row (quoted for copy-paste), so a mismatch can be reproduced and debugged manually outside the script |
+| `match_method` | How the target result was found: `similarity_id` or `path_nodes`; empty if nothing matched |
+| `Calculator_Command` | The exact `SimilarityCalculator.exe` command run for this row (quoted for copy-paste), so a result can be reproduced and debugged manually outside the script |
 
 Default output file is `similarity_comparison.csv` (override with `--output`).
+
+### Status values
+
+- **MATCHED** — the source result was found in the target, either by its computed similarity ID matching a real target similarity ID, or (when that didn't happen, e.g. the calculator step was skipped) by the path-node fallback.
+- **SIMILARITY_MISMATCH** — the source result *is* present in the target (found via the path-node fallback), but its computed similarity ID did not match the target's actual similarity ID for that result. Nothing is missing; the calculator's output for this result just wouldn't have found it on its own.
+- **NOT_FOUND** — no result in the target scan matched by computed similarity ID or by path nodes.
+- **NO_QUERY** — the source query has no entry in `mapping.json` and was not found by name in the target query library.
+- **ERROR** — the source query ID was not found in the query collection.
 
 ---
 
@@ -187,4 +195,4 @@ Default output file is `similarity_comparison.csv` (override with `--output`).
 - **Comments** are built from the full comment history (via `GetPathCommentsHistory`). Any comments present in the source but absent from the target are consolidated into a single string (preserving the original author/timestamp text) and attached to the last `/labels` call for that result, so the comment always lands even when state/severity/assignee are unchanged.
 - **State/severity/assignee history** is replayed in chronological order — one `/labels` call per historical change, carrying forward the latest known values each time — when the OData `ResultTriageHistories` endpoint is available. If it is not (older CxSAST versions), only the final values are applied in a single call.
 - **`SimilarityCalculator.exe`** is a Windows-only binary and is optional. It's called with 12 plain positional arguments — `filename, name, line, column, methodLine` for the source node, the same five for the destination node, the resolved target query ID, and the sim-ID version (`0`, `1`, or `2`, via `--sim-version` or the `SIM_ID_VERSION` env var) — matching Checkmarx's own reference caller ([sast-to-ast-export](https://github.com/Checkmarx/sast-to-ast-export/blob/master/internal/integration/similarity/similarity_id_calculator.go)). There is no `--simIdVersion` flag. Column and method-line come from the **source** scan's own `GetResultPathsForQuery` SOAP call (per source QueryId) — `GetResultsForScan`'s `SourceLine`/`DestLine` etc. don't include them — taking the first and last node of each result's path. `filename` must be a real local file, not just the recorded folder/filename string, so its actual content is downloaded first via `GetSourcesByScanID` (remote path = plain backslash concatenation of `SourceFolder`+`SourceFile`, preserving the folder's own leading backslash — confirmed by live testing; the per-item `IsSuccesfull` flag in the response is **not** a reliable fetch-status indicator, an empty `Source` string is). On non-Windows platforms the calculator step is automatically skipped.
-- **Matching prefers computed similarity ID over path nodes** when `--similarity-calculator` is set: for each source result, the computed similarity ID is compared against each target-query candidate's actual similarity IDs first (the mechanism CxSAST itself uses to identify the same finding across scans), falling back to path-node comparison only if no similarity-ID match is found. `--compare-triages` deliberately matches by path nodes only, since its purpose is validating the calculator independently — it can't also use the calculator's own output to decide what counts as a match.
+- **Matching prefers computed similarity ID over path nodes** when `--similarity-calculator` is set: for each source result, the computed similarity ID is compared against each target-query candidate's actual similarity IDs first (the mechanism CxSAST itself uses to identify the same finding across scans), falling back to path-node comparison only if no similarity-ID match is found. `--compare-triages` uses this same priority, so its report reflects what a real migration run would actually match.

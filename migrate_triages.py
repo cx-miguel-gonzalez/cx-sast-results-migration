@@ -81,7 +81,7 @@ COMPARE_CSV_FIELDS = [
     "query_name", "language", "group",
     "source_path_id", "target_path_id",
     "source_similarity_id", "computed_similarity_id", "target_similarity_id",
-    "matches",
+    "match_method",
     "Calculator_Command",
     "detail",
 ]
@@ -1290,14 +1290,16 @@ def compare_project_similarity(
     args,
 ) -> Tuple[List[dict], Dict[str, int], bool]:
     """
-    Compare SimilarityCalculator.exe's computed target similarity IDs against
-    what's actually present in the target scan, for every result in a
-    project's latest scans (not just triaged ones). Read-only — makes no
-    changes to either environment.
+    Confirm every result in a project's latest source scan (not just triaged
+    ones) can be found in the target scan: compute each one's target
+    similarity ID via SimilarityCalculator.exe, then try to match it to a
+    target result the same way the real migration does — by that computed
+    similarity ID first, falling back to path-node comparison. Read-only —
+    makes no changes to either environment.
 
     Returns (csv_rows, counts, ok).
     """
-    counts = {"matched": 0, "not_found": 0, "query_missing": 0, "error": 0}
+    counts = {"matched": 0, "similarity_mismatch": 0, "not_found": 0, "query_missing": 0, "error": 0}
     csv_rows: List[dict] = []
     src_path_nodes_cache: Dict[int, Dict[int, List[dict]]] = {}
     source_files_dir: Optional[str] = None
@@ -1360,10 +1362,7 @@ def compare_project_similarity(
     print(f"  Downloaded {len(local_source_files)}/{len(remote_paths)} files")
 
     try:
-        print(f"\n=== Comparing similarity IDs for {len(all_src_results)} source results ===")
-
-        matches_count = 0
-        mismatches_count = 0
+        print(f"\n=== Confirming {len(all_src_results)} source results are present in target ===")
 
         for orig in all_src_results:
             src_qid   = orig["QueryId"]
@@ -1381,7 +1380,7 @@ def compare_project_similarity(
                 "source_similarity_id": src_sim,
                 "computed_similarity_id": "",
                 "target_similarity_id": "",
-                "matches": "",
+                "match_method": "",
                 "Calculator_Command": "",
             }
 
@@ -1397,18 +1396,17 @@ def compare_project_similarity(
             mk    = (lang.strip(), group.strip(), name.strip())
             row_base.update({"query_name": name, "language": lang, "group": group})
 
-            # Path-node matching only here (no computed_sim/tgt_sim_map) — this
-            # mode's whole point is validating the calculator independently,
-            # so it can't also use the calculator's own output to decide matches.
             candidate_qids = resolve_candidate_qids(mk, mapping, tgt_query_by_key)
-            dest, tried, _match_method = match_target_result(orig, candidate_qids, tgt_by_query)
-
             if not candidate_qids:
                 counts["query_missing"] += 1
                 csv_rows.append({**row_base, "status": "NO_QUERY",
                                  "detail": "Query not in mapping.json and not found in target"})
                 continue
 
+            # Compute the target similarity ID via SimilarityCalculator.exe —
+            # this drives matching itself (see below), the same way the real
+            # migration uses it, since the point of this mode is confirming
+            # every source result can actually be found in the target this way.
             src_local = local_source_files.get(normalize_remote_path(orig["SourceFolder"], orig["SourceFile"]))
             dst_local = local_source_files.get(normalize_remote_path(orig["DestFolder"], orig["DestFile"]))
             computed_sim = ""
@@ -1429,30 +1427,41 @@ def compare_project_similarity(
                 computed_sim = run_similarity_calculator(calc_argv) or ""
             row_base["computed_similarity_id"] = computed_sim
 
+            # Match by computed similarity ID first, falling back to path-node
+            # comparison — identical priority to the real migration's matching,
+            # so this report reflects what would actually happen in a real run.
+            dest, tried, match_method = match_target_result(
+                orig, candidate_qids, tgt_by_query, tgt_sim_map=tgt_sim_map, computed_sim=computed_sim
+            )
+            row_base["match_method"] = match_method
+
             if dest is None:
                 counts["not_found"] += 1
                 tried_str = ", ".join(f"QueryId={q} ({n} result(s))" for q, n in tried)
-                csv_rows.append({**row_base, "status": "NOT_FOUND", "matches": "False",
+                csv_rows.append({**row_base, "status": "NOT_FOUND",
                                  "detail": f"No matching result found in target scan; tried {tried_str}"})
                 continue
 
-            counts["matched"] += 1
             target_sim = tgt_sim_map.get(dest["PathId"], "")
-            matches = bool(computed_sim) and computed_sim == target_sim
-            if matches:
-                matches_count += 1
-            else:
-                mismatches_count += 1
+            row_base["target_path_id"] = dest["PathId"]
+            row_base["target_similarity_id"] = target_sim
 
-            csv_rows.append({**row_base, "status": "MATCHED",
-                             "target_path_id": dest["PathId"],
-                             "target_similarity_id": target_sim,
-                             "matches": str(matches),
-                             "detail": ""})
+            if match_method == "path_nodes" and computed_sim and computed_sim != target_sim:
+                # Present in the target (found via path nodes), but the
+                # calculator's own output didn't match this result's actual
+                # similarity ID — flagged separately from NOT_FOUND since
+                # nothing is actually missing, only the computed ID is wrong.
+                counts["similarity_mismatch"] += 1
+                csv_rows.append({**row_base, "status": "SIMILARITY_MISMATCH",
+                                 "detail": "Found via path-node match, but the computed similarity "
+                                           "ID did not match the target's actual similarity ID"})
+                continue
+
+            counts["matched"] += 1
+            csv_rows.append({**row_base, "status": "MATCHED", "detail": ""})
 
         print(f"  Matched:             {counts['matched']}")
-        print(f"    Similarity OK:       {matches_count}")
-        print(f"    Similarity MISMATCH: {mismatches_count}")
+        print(f"  Similarity mismatch: {counts['similarity_mismatch']}")
         print(f"  Not found:           {counts['not_found']}")
         print(f"  Query missing:       {counts['query_missing']}")
         print(f"  Errors:              {counts['error']}")
@@ -1491,12 +1500,13 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch and match everything but skip uploading triages")
     parser.add_argument("--compare-triages", action="store_true",
-                        help="Read-only mode: for every result in each project's latest scans "
-                             "(not just triaged ones), compute the target similarity ID via "
-                             "SimilarityCalculator.exe and compare it against the target scan's "
-                             "actual similarity ID. Writes a CSV with source/computed/target "
-                             "similarity IDs and a matches column. Makes no changes to either "
-                             "environment; requires --similarity-calculator.")
+                        help="Read-only mode: confirm every result in each project's latest source "
+                             "scan (not just triaged ones) can be found in the target scan, by "
+                             "computing its target similarity ID via SimilarityCalculator.exe and "
+                             "matching it the same way the real migration does (similarity ID "
+                             "first, path-node fallback). Writes a CSV with a status column "
+                             "(MATCHED, SIMILARITY_MISMATCH, NOT_FOUND, NO_QUERY, ERROR). Makes no "
+                             "changes to either environment; requires --similarity-calculator.")
     args = parser.parse_args()
 
     # argparse's `choices` only validates values passed on the command line, not
@@ -1599,6 +1609,7 @@ def main():
     skipped_projects: List[str] = []
 
     if args.compare_triages:
+        total_similarity_mismatch = 0
         for i, project_input in enumerate(projects, 1):
             if len(projects) > 1:
                 print(f"\n{'#' * 70}\n# Project {i}/{len(projects)}: {project_input}\n{'#' * 70}")
@@ -1612,20 +1623,17 @@ def main():
                 failed_projects.append(project_input)
             all_csv_rows.extend(csv_rows)
             for k in total_counts:
-                total_counts[k] += counts[k]
+                total_counts[k] += counts.get(k, 0)
+            total_similarity_mismatch += counts.get("similarity_mismatch", 0)
 
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=COMPARE_CSV_FIELDS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(all_csv_rows)
 
-        matches_total = sum(1 for r in all_csv_rows if r.get("matches") == "True")
-        mismatches_total = sum(1 for r in all_csv_rows if r.get("matches") == "False")
-
         print(f"\nCSV written to: {output_path}")
         print(f"  Matched:             {total_counts['matched']}")
-        print(f"    Similarity OK:       {matches_total}")
-        print(f"    Similarity MISMATCH: {mismatches_total}")
+        print(f"  Similarity mismatch: {total_similarity_mismatch}")
         print(f"  Not found:           {total_counts['not_found']}")
         print(f"  Query missing:       {total_counts['query_missing']}")
         print(f"  Errors:              {total_counts['error']}")
